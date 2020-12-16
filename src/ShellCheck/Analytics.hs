@@ -1,8 +1,8 @@
 {-
-    Copyright 2012-2015 Vidar Holen
+    Copyright 2012-2019 Vidar Holen
 
     This file is part of ShellCheck.
-    http://www.vidarholen.net/contents/shellcheck
+    https://www.shellcheck.net
 
     ShellCheck is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,10 +15,11 @@
     GNU General Public License for more details.
 
     You should have received a copy of the GNU General Public License
-    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 -}
-{-# LANGUAGE TemplateHaskell, FlexibleContexts #-}
-module ShellCheck.Analytics (runAnalytics, ShellCheck.Analytics.runTests) where
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE FlexibleContexts #-}
+module ShellCheck.Analytics (runAnalytics, optionalChecks, ShellCheck.Analytics.runTests) where
 
 import ShellCheck.AST
 import ShellCheck.ASTLib
@@ -32,7 +33,7 @@ import Control.Arrow (first)
 import Control.Monad
 import Control.Monad.Identity
 import Control.Monad.State
-import Control.Monad.Writer
+import Control.Monad.Writer hiding ((<>))
 import Control.Monad.Reader
 import Data.Char
 import Data.Functor
@@ -40,17 +41,16 @@ import Data.Function (on)
 import Data.List
 import Data.Maybe
 import Data.Ord
+import Data.Semigroup
 import Debug.Trace
-import qualified Data.Map as Map
+import qualified Data.Map.Strict as Map
 import Test.QuickCheck.All (forAllProperties)
 import Test.QuickCheck.Test (quickCheckWithResult, stdArgs, maxSuccess)
 
 -- Checks that are run on the AST root
 treeChecks :: [Parameters -> Token -> [TokenComment]]
 treeChecks = [
-    runNodeAnalysis
-        (\p t -> (mapM_ ((\ f -> f t) . (\ f -> f p))
-            nodeChecks))
+    nodeChecksToTreeCheck nodeChecks
     ,subshellAssignmentCheck
     ,checkSpacefulness
     ,checkQuotesInLiterals
@@ -61,13 +61,22 @@ treeChecks = [
     ,checkArrayWithoutIndex
     ,checkShebang
     ,checkUnassignedReferences
-    ,checkUncheckedCd
+    ,checkUncheckedCdPushdPopd
     ,checkArrayAssignmentIndices
+    ,checkUseBeforeDefinition
+    ,checkAliasUsedInSameParsingUnit
     ]
 
 runAnalytics :: AnalysisSpec -> [TokenComment]
 runAnalytics options =
-        runList options treeChecks
+    runList options treeChecks ++ runList options optionalChecks
+  where
+    root = asScript options
+    optionals = getEnableDirectives root ++ asOptionalChecks options
+    optionalChecks =
+        if "all" `elem` optionals
+        then map snd optionalTreeChecks
+        else mapMaybe (\c -> Map.lookup c optionalCheckMap) optionals
 
 runList :: AnalysisSpec -> [Parameters -> Token -> [TokenComment]]
     -> [TokenComment]
@@ -77,12 +86,21 @@ runList spec list = notes
         params = makeParameters spec
         notes = concatMap (\f -> f params root) list
 
+getEnableDirectives root =
+    case root of
+        T_Annotation _ list _ -> [s | EnableComment s <- list]
+        _ -> []
 
 checkList l t = concatMap (\f -> f t) l
 
-
 -- Checks that are run on each node in the AST
 runNodeAnalysis f p t = execWriter (doAnalysis (f p) t)
+
+-- Perform multiple node checks in a single iteration over the tree
+nodeChecksToTreeCheck checkList =
+    runNodeAnalysis
+        (\p t -> (mapM_ ((\ f -> f t) . (\ f -> f p))
+            checkList))
 
 nodeChecks :: [Parameters -> Token -> Writer [TokenComment] ()]
 nodeChecks = [
@@ -104,6 +122,7 @@ nodeChecks = [
     ,checkArithmeticDeref
     ,checkArithmeticBadOctal
     ,checkComparisonAgainstGlob
+    ,checkCaseAgainstGlob
     ,checkCommarrays
     ,checkOrNeq
     ,checkEchoWc
@@ -118,7 +137,6 @@ nodeChecks = [
     ,checkGlobbedRegex
     ,checkTestRedirects
     ,checkIndirectExpansion
-    ,checkSudoRedirect
     ,checkPS1Assignments
     ,checkBackticks
     ,checkInexplicablyUnquoted
@@ -141,7 +159,6 @@ nodeChecks = [
     ,checkWrongArithmeticAssignment
     ,checkConditionalAndOrs
     ,checkFunctionDeclarations
-    ,checkCatastrophicRm
     ,checkStderrPipe
     ,checkOverridingPath
     ,checkArrayAsString
@@ -160,8 +177,83 @@ nodeChecks = [
     ,checkRedirectedNowhere
     ,checkUnmatchableCases
     ,checkSubshellAsTest
+    ,checkSplittingInArrays
+    ,checkRedirectionToNumber
+    ,checkGlobAsCommand
+    ,checkFlagAsCommand
+    ,checkEmptyCondition
+    ,checkPipeToNowhere
+    ,checkForLoopGlobVariables
+    ,checkSubshelledTests
+    ,checkInvertedStringTest
+    ,checkRedirectionToCommand
+    ,checkDollarQuoteParen
+    ,checkUselessBang
+    ,checkTranslatedStringVariable
+    ,checkModifiedArithmeticInRedirection
+    ,checkBlatantRecursion
+    ,checkBadTestAndOr
+    ,checkAssignToSelf
     ]
 
+optionalChecks = map fst optionalTreeChecks
+
+
+prop_verifyOptionalExamples = all check optionalTreeChecks
+  where
+    check (desc, check) =
+        verifyTree check (cdPositive desc)
+        && verifyNotTree check (cdNegative desc)
+
+optionalTreeChecks :: [(CheckDescription, (Parameters -> Token -> [TokenComment]))]
+optionalTreeChecks = [
+    (newCheckDescription {
+        cdName = "quote-safe-variables",
+        cdDescription = "Suggest quoting variables without metacharacters",
+        cdPositive = "var=hello; echo $var",
+        cdNegative = "var=hello; echo \"$var\""
+    }, checkVerboseSpacefulness)
+
+    ,(newCheckDescription {
+        cdName = "avoid-nullary-conditions",
+        cdDescription = "Suggest explicitly using -n in `[ $var ]`",
+        cdPositive = "[ \"$var\" ]",
+        cdNegative = "[ -n \"$var\" ]"
+    }, nodeChecksToTreeCheck [checkNullaryExpansionTest])
+
+    ,(newCheckDescription {
+        cdName = "add-default-case",
+        cdDescription = "Suggest adding a default case in `case` statements",
+        cdPositive = "case $? in 0) echo 'Success';; esac",
+        cdNegative = "case $? in 0) echo 'Success';; *) echo 'Fail' ;; esac"
+    }, nodeChecksToTreeCheck [checkDefaultCase])
+
+    ,(newCheckDescription {
+        cdName = "require-variable-braces",
+        cdDescription = "Suggest putting braces around all variable references",
+        cdPositive = "var=hello; echo $var",
+        cdNegative = "var=hello; echo ${var}"
+    }, nodeChecksToTreeCheck [checkVariableBraces])
+
+    ,(newCheckDescription {
+        cdName = "check-unassigned-uppercase",
+        cdDescription = "Warn when uppercase variables are unassigned",
+        cdPositive = "echo $VAR",
+        cdNegative = "VAR=hello; echo $VAR"
+    }, checkUnassignedReferences' True)
+
+    ,(newCheckDescription {
+        cdName = "avoid-x-comparisons",
+        cdDescription = "Warn about 'x'-prefix in comparisons",
+        cdPositive = "[ \"x$var\" = xval ]",
+        cdNegative = "[ \"$var\" = val ]"
+    }, nodeChecksToTreeCheck [checkComparisonWithLeadingX])
+    ]
+
+optionalCheckMap :: Map.Map String (Parameters -> Token -> [TokenComment])
+optionalCheckMap = Map.fromList $ map item optionalTreeChecks
+  where
+    item (desc, check) = (cdName desc, check)
 
 wouldHaveBeenGlob s = '*' `elem` s
 
@@ -177,20 +269,25 @@ verifyTree f s = producesComments f s == Just True
 verifyNotTree :: (Parameters -> Token -> [TokenComment]) -> String -> Bool
 verifyNotTree f s = producesComments f s == Just False
 
-checkCommand str f t@(T_SimpleCommand id _ (cmd:rest)) =
-    when (t `isCommand` str) $ f cmd rest
+checkCommand str f t@(T_SimpleCommand id _ (cmd:rest))
+    | t `isCommand` str = f cmd rest
 checkCommand _ _ _ = return ()
 
-checkUnqualifiedCommand str f t@(T_SimpleCommand id _ (cmd:rest)) =
-    when (t `isUnqualifiedCommand` str) $ f cmd rest
+checkUnqualifiedCommand str f t@(T_SimpleCommand id _ (cmd:rest))
+    | t `isUnqualifiedCommand` str = f cmd rest
 checkUnqualifiedCommand _ _ _ = return ()
 
 
 checkNode f = producesComments (runNodeAnalysis f)
 producesComments :: (Parameters -> Token -> [TokenComment]) -> String -> Maybe Bool
 producesComments f s = do
-        root <- pScript s
-        return . not . null $ runList (defaultSpec root) [f]
+        let pr = pScript s
+        prRoot pr
+        let spec = defaultSpec pr
+        let params = makeParameters spec
+        return . not . null $
+            filterByAnnotation spec params $
+                runList spec [f]
 
 -- Copied from https://wiki.haskell.org/Edit_distance
 dist :: Eq a => [a] -> [a] -> Int
@@ -220,7 +317,9 @@ hasFloatingPoint params = shellType params == Ksh
 isCondition [] = False
 isCondition [_] = False
 isCondition (child:parent:rest) =
-    getId child `elem` map getId (getConditionChildren parent) || isCondition (parent:rest)
+    case child of
+        T_BatsTest {} -> True -- count anything in a @test as conditional
+        _ -> getId child `elem` map getId (getConditionChildren parent) || isCondition (parent:rest)
   where
     getConditionChildren t =
         case t of
@@ -230,6 +329,43 @@ isCondition (child:parent:rest) =
             T_WhileExpression id c l -> take 1 . reverse $ c
             T_UntilExpression id c l -> take 1 . reverse $ c
             _ -> []
+
+-- helpers to build replacements
+replaceStart id params n r =
+    let tp = tokenPositions params
+        (start, _) = tp Map.! id
+        new_end = start {
+            posColumn = posColumn start + n
+        }
+        depth = length $ getPath (parentMap params) (T_EOF id)
+    in
+    newReplacement {
+        repStartPos = start,
+        repEndPos = new_end,
+        repString = r,
+        repPrecedence = depth,
+        repInsertionPoint = InsertAfter
+    }
+replaceEnd id params n r =
+    let tp = tokenPositions params
+        (_, end) = tp Map.! id
+        new_start = end {
+            posColumn = posColumn end - n
+        }
+        new_end = end {
+            posColumn = posColumn end
+        }
+        depth = length $ getPath (parentMap params) (T_EOF id)
+    in
+    newReplacement {
+        repStartPos = new_start,
+        repEndPos = new_end,
+        repString = r,
+        repPrecedence = depth,
+        repInsertionPoint = InsertBefore
+    }
+surroundWidth id params s = fixWith [replaceStart id params 0 s, replaceEnd id params 0 s]
+fixWith fixes = newFix { fixReplacements = fixes }
 
 prop_checkEchoWc3 = verify checkEchoWc "n=$(echo $foo | wc -c)"
 checkEchoWc _ (T_Pipeline id _ [a, b]) =
@@ -255,22 +391,32 @@ prop_checkAssignAteCommand1 = verify checkAssignAteCommand "A=ls -l"
 prop_checkAssignAteCommand2 = verify checkAssignAteCommand "A=ls --sort=$foo"
 prop_checkAssignAteCommand3 = verify checkAssignAteCommand "A=cat foo | grep bar"
 prop_checkAssignAteCommand4 = verifyNot checkAssignAteCommand "A=foo ls -l"
-prop_checkAssignAteCommand5 = verifyNot checkAssignAteCommand "PAGER=cat grep bar"
-checkAssignAteCommand _ (T_SimpleCommand id (T_Assignment _ _ _ _ assignmentTerm:[]) (firstWord:_)) =
-    when ("-" `isPrefixOf` concat (oversimplify firstWord) ||
-        isCommonCommand (getLiteralString assignmentTerm)
-            && not (isCommonCommand (getLiteralString firstWord))) $
-                warn id 2037 "To assign the output of a command, use var=$(cmd) ."
+prop_checkAssignAteCommand5 = verify checkAssignAteCommand "PAGER=cat grep bar"
+prop_checkAssignAteCommand6 = verifyNot checkAssignAteCommand "PAGER=\"cat\" grep bar"
+prop_checkAssignAteCommand7 = verify checkAssignAteCommand "here=pwd"
+checkAssignAteCommand _ (T_SimpleCommand id (T_Assignment _ _ _ _ assignmentTerm:[]) list) =
+    -- Check if first word is intended as an argument (flag or glob).
+    if firstWordIsArg list
+    then
+        err id 2037 "To assign the output of a command, use var=$(cmd) ."
+    else
+        -- Check if it's a known, unquoted command name.
+        when (isCommonCommand $ getUnquotedLiteral assignmentTerm) $
+            warn id 2209 "Use var=$(command) to assign output (or quote to assign string)."
   where
     isCommonCommand (Just s) = s `elem` commonCommands
     isCommonCommand _ = False
+    firstWordIsArg list = fromMaybe False $ do
+        head <- list !!! 0
+        return $ isGlob head || isUnquotedFlag head
+
 checkAssignAteCommand _ _ = return ()
 
 prop_checkArithmeticOpCommand1 = verify checkArithmeticOpCommand "i=i + 1"
 prop_checkArithmeticOpCommand2 = verify checkArithmeticOpCommand "foo=bar * 2"
 prop_checkArithmeticOpCommand3 = verifyNot checkArithmeticOpCommand "foo + opts"
 checkArithmeticOpCommand _ (T_SimpleCommand id [T_Assignment {}] (firstWord:_)) =
-    fromMaybe (return ()) $ check <$> getGlobOrLiteralString firstWord
+    mapM_ check $ getGlobOrLiteralString firstWord
   where
     check op =
         when (op `elem` ["+", "-", "*", "/"]) $
@@ -281,7 +427,7 @@ checkArithmeticOpCommand _ _ = return ()
 prop_checkWrongArit = verify checkWrongArithmeticAssignment "i=i+1"
 prop_checkWrongArit2 = verify checkWrongArithmeticAssignment "n=2; i=n*2"
 checkWrongArithmeticAssignment params (T_SimpleCommand id (T_Assignment _ _ _ _ val:[]) []) =
-  fromMaybe (return ()) $ do
+  sequence_ $ do
     str <- getNormalString val
     match <- matchRegex regex str
     var <- match !!! 0
@@ -297,7 +443,7 @@ checkWrongArithmeticAssignment params (T_SimpleCommand id (T_Assignment _ _ _ _ 
     insertRef _ = Prelude.id
 
     getNormalString (T_NormalWord _ words) = do
-        parts <- foldl (liftM2 (\x y -> x ++ [y])) (Just []) $ map getLiterals words
+        parts <- mapM getLiterals words
         return $ concat parts
     getNormalString _ = Nothing
 
@@ -316,7 +462,7 @@ prop_checkUuoc6 = verifyNot checkUuoc "cat -n | grep bar"
 checkUuoc _ (T_Pipeline _ _ (T_Redirecting _ _ cmd:_:_)) =
     checkCommand "cat" (const f) cmd
   where
-    f [word] = unless (mayBecomeMultipleArgs word || isOption word) $
+    f [word] | not (mayBecomeMultipleArgs word || isOption word) =
         style (getId word) 2002 "Useless cat. Consider 'cmd < file | ..' or 'cmd file | ..' instead."
     f _ = return ()
     isOption word = "-" `isPrefixOf` onlyLiteralString word
@@ -349,31 +495,27 @@ checkPipePitfalls _ (T_Pipeline id _ commands) = do
               ]) $ warn (getId find) 2038
                       "Use -print0/-0 or -exec + to allow for non-alphanumeric filenames."
 
-    for ["?", "echo"] $
-        \(_:echo:_) -> info (getId echo) 2008 "echo doesn't read from stdin, are you sure you should be piping to it?"
-
     for' ["ps", "grep"] $
         \x -> info x 2009 "Consider using pgrep instead of grepping ps output."
 
     for ["grep", "wc"] $
         \(grep:wc:_) ->
-            let flagsGrep = fromMaybe [] $ map snd <$> getAllFlags <$> getCommand grep
-                flagsWc = fromMaybe [] $ map snd <$> getAllFlags <$> getCommand wc
+            let flagsGrep = maybe [] (map snd . getAllFlags) $ getCommand grep
+                flagsWc = maybe [] (map snd . getAllFlags) $ getCommand wc
             in
-                unless ((any (`elem` ["o", "only-matching", "r", "R", "recursive"]) flagsGrep) || (any (`elem` ["m", "chars", "w", "words", "c", "bytes", "L", "max-line-length"]) flagsWc) || ((length flagsWc) == 0)) $
+                unless (any (`elem` ["o", "only-matching", "r", "R", "recursive"]) flagsGrep || any (`elem` ["m", "chars", "w", "words", "c", "bytes", "L", "max-line-length"]) flagsWc || null flagsWc) $
                     style (getId grep) 2126 "Consider using grep -c instead of grep|wc -l."
 
-    didLs <- liftM or . sequence $ [
+    didLs <- fmap or . sequence $ [
         for' ["ls", "grep"] $
             \x -> warn x 2010 "Don't use ls | grep. Use a glob or a for loop with a condition to allow non-alphanumeric filenames.",
         for' ["ls", "xargs"] $
             \x -> warn x 2011 "Use 'find .. -print0 | xargs -0 ..' or 'find .. -exec .. +' to allow non-alphanumeric filenames."
         ]
-    unless didLs $ do
+    unless didLs $ void $
         for ["ls", "?"] $
             \(ls:_) -> unless (hasShortParameter 'N' (oversimplify ls)) $
                 info (getId ls) 2012 "Use find instead of ls to better handle non-alphanumeric filenames."
-        return ()
   where
     for l f =
         let indices = indexOfSublists l (map (headOrDefault "" . oversimplify) commands)
@@ -381,7 +523,7 @@ checkPipePitfalls _ (T_Pipeline id _ commands) = do
             mapM_ (f . (\ n -> take (length l) $ drop n commands)) indices
             return . not . null $ indices
     for' l f = for l (first f)
-    first func (x:_) = func (getId x)
+    first func (x:_) = func (getId $ getCommandTokenOrThis x)
     first _ _ = return ()
     hasShortParameter char = any (\x -> "-" `isPrefixOf` x && char `elem` x)
     hasParameter string =
@@ -404,9 +546,14 @@ indexOfSublists sub = f 0
 
 prop_checkShebangParameters1 = verifyTree checkShebangParameters "#!/usr/bin/env bash -x\necho cow"
 prop_checkShebangParameters2 = verifyNotTree checkShebangParameters "#! /bin/sh  -l "
+prop_checkShebangParameters3 = verifyNotTree checkShebangParameters "#!/usr/bin/env -S bash -x\necho cow"
+prop_checkShebangParameters4 = verifyNotTree checkShebangParameters "#!/usr/bin/env --split-string bash -x\necho cow"
 checkShebangParameters p (T_Annotation _ _ t) = checkShebangParameters p t
-checkShebangParameters _ (T_Script id sb _) =
-    [makeComment ErrorC id 2096 "On most OS, shebangs can only specify a single parameter." | length (words sb) > 2]
+checkShebangParameters _ (T_Script _ (T_Literal id sb) _) =
+    [makeComment ErrorC id 2096 "On most OS, shebangs can only specify a single parameter." | isMultiWord]
+  where
+    isMultiWord = length (words sb) > 2 && not (sb `matches` re)
+    re = mkRegex "env +(-S|--split-string)"
 
 prop_checkShebang1 = verifyNotTree checkShebang "#!/usr/bin/env bash -x\necho cow"
 prop_checkShebang2 = verifyNotTree checkShebang "#! /bin/sh  -l "
@@ -415,17 +562,27 @@ prop_checkShebang4 = verifyNotTree checkShebang "#shellcheck shell=sh\nfoo"
 prop_checkShebang5 = verifyTree checkShebang "#!/usr/bin/env ash"
 prop_checkShebang6 = verifyNotTree checkShebang "#!/usr/bin/env ash\n# shellcheck shell=dash\n"
 prop_checkShebang7 = verifyNotTree checkShebang "#!/usr/bin/env ash\n# shellcheck shell=sh\n"
+prop_checkShebang8 = verifyTree checkShebang "#!bin/sh\ntrue"
+prop_checkShebang9 = verifyNotTree checkShebang "# shellcheck shell=sh\ntrue"
+prop_checkShebang10= verifyNotTree checkShebang "#!foo\n# shellcheck shell=sh ignore=SC2239\ntrue"
+prop_checkShebang11= verifyTree checkShebang "#!/bin/sh/\ntrue"
+prop_checkShebang12= verifyTree checkShebang "#!/bin/sh/ -xe\ntrue"
 checkShebang params (T_Annotation _ list t) =
     if any isOverride list then [] else checkShebang params t
   where
     isOverride (ShellOverride _) = True
     isOverride _ = False
-checkShebang params (T_Script id sb _) = execWriter $
+checkShebang params (T_Script _ (T_Literal id sb) _) = execWriter $ do
     unless (shellTypeSpecified params) $ do
-        when (sb == "") $
-            err id 2148 "Tips depend on target shell and yours is unknown. Add a shebang."
+        when (null sb) $
+            err id 2148 "Tips depend on target shell and yours is unknown. Add a shebang or a 'shell' directive."
         when (executableFromShebang sb == "ash") $
             warn id 2187 "Ash scripts will be checked as Dash. Add '# shellcheck shell=dash' to silence."
+    unless (null sb) $ do
+        unless ("/" `isPrefixOf` sb) $
+            err id 2239 "Ensure the shebang uses an absolute path to the interpreter."
+        when ("/" `isSuffixOf` head (words sb)) $
+            err id 2246 "This shebang specifies a directory. Ensure the interpreter is a file."
 
 
 prop_checkForInQuoted = verify checkForInQuoted "for f in \"$(ls)\"; do echo foo; done"
@@ -437,17 +594,29 @@ prop_checkForInQuoted4 = verify checkForInQuoted "for f in 1,2,3; do true; done"
 prop_checkForInQuoted4a = verifyNot checkForInQuoted "for f in foo{1,2,3}; do true; done"
 prop_checkForInQuoted5 = verify checkForInQuoted "for f in ls; do true; done"
 prop_checkForInQuoted6 = verifyNot checkForInQuoted "for f in \"${!arr}\"; do true; done"
-checkForInQuoted _ (T_ForIn _ f [T_NormalWord _ [word@(T_DoubleQuoted id list)]] _) =
-    when (any (\x -> willSplit x && not (mayBecomeMultipleArgs x)) list
-            || (liftM wouldHaveBeenGlob (getLiteralString word) == Just True)) $
+prop_checkForInQuoted7 = verify checkForInQuoted "for f in ls, grep, mv; do true; done"
+prop_checkForInQuoted8 = verify checkForInQuoted "for f in 'ls', 'grep', 'mv'; do true; done"
+prop_checkForInQuoted9 = verifyNot checkForInQuoted "for f in 'ls,' 'grep,' 'mv'; do true; done"
+checkForInQuoted _ (T_ForIn _ f [T_NormalWord _ [word@(T_DoubleQuoted id list)]] _)
+    | any (\x -> willSplit x && not (mayBecomeMultipleArgs x)) list
+            || maybe False wouldHaveBeenGlob (getLiteralString word) =
         err id 2066 "Since you double quoted this, it will not word split, and the loop will only run once."
 checkForInQuoted _ (T_ForIn _ f [T_NormalWord _ [T_SingleQuoted id _]] _) =
     warn id 2041 "This is a literal string. To run as a command, use $(..) instead of '..' . "
-checkForInQuoted _ (T_ForIn _ f [T_NormalWord _ [T_Literal id s]] _) =
-    if ',' `elem` s
-      then unless ('{' `elem` s) $
-            warn id 2042 "Use spaces, not commas, to separate loop elements."
-      else warn id 2043 "This loop will only ever run once for a constant value. Did you perhaps mean to loop over dir/*, $var or $(cmd)?"
+checkForInQuoted _ (T_ForIn _ _ [single] _)
+    | maybe False (',' `elem`) $ getUnquotedLiteral single =
+        warn (getId single) 2042 "Use spaces, not commas, to separate loop elements."
+    | not (willSplit single || mayBecomeMultipleArgs single) =
+        warn (getId single) 2043 "This loop will only ever run once. Bad quoting or missing glob/expansion?"
+checkForInQuoted params (T_ForIn _ _ multiple _) =
+    forM_ multiple $ \arg -> sequence_ $ do
+        suffix <- getTrailingUnquotedLiteral arg
+        string <- getLiteralString suffix
+        guard $ "," `isSuffixOf` string
+        return $
+            warnWithFix (getId arg) 2258
+                "The trailing comma is part of the value, not a separator. Delete or quote it."
+                (fixWith [replaceEnd (getId suffix) params 1 ""])
 checkForInQuoted _ _ = return ()
 
 prop_checkForInCat1 = verify checkForInCat "for f in $(cat foo); do stuff; done"
@@ -559,17 +728,19 @@ prop_checkRedirectToSame4 = verifyNot checkRedirectToSame "foo /dev/null > /dev/
 prop_checkRedirectToSame5 = verifyNot checkRedirectToSame "foo > bar 2> bar"
 prop_checkRedirectToSame6 = verifyNot checkRedirectToSame "echo foo > foo"
 prop_checkRedirectToSame7 = verifyNot checkRedirectToSame "sed 's/foo/bar/g' file | sponge file"
+prop_checkRedirectToSame8 = verifyNot checkRedirectToSame "while read -r line; do _=\"$fname\"; done <\"$fname\""
 checkRedirectToSame params s@(T_Pipeline _ _ list) =
     mapM_ (\l -> (mapM_ (\x -> doAnalysis (checkOccurrences x) l) (getAllRedirs list))) list
   where
     note x = makeComment InfoC x 2094
                 "Make sure not to read and write the same file in the same pipeline."
-    checkOccurrences t@(T_NormalWord exceptId x) u@(T_NormalWord newId y) =
-        when (exceptId /= newId
+    checkOccurrences t@(T_NormalWord exceptId x) u@(T_NormalWord newId y) |
+        exceptId /= newId
                 && x == y
                 && not (isOutput t && isOutput u)
                 && not (special t)
-                && not (any isHarmlessCommand [t,u])) $ do
+                && not (any isHarmlessCommand [t,u])
+                && not (any containsAssignment [u]) = do
             addComment $ note newId
             addComment $ note exceptId
     checkOccurrences _ _ = return ()
@@ -596,6 +767,9 @@ checkRedirectToSame params s@(T_Pipeline _ _ list) =
         cmd <- getClosestCommand (parentMap params) arg
         name <- getCommandBasename cmd
         return $ name `elem` ["echo", "printf", "sponge"]
+    containsAssignment arg = fromMaybe False $ do
+        cmd <- getClosestCommand (parentMap params) arg
+        return $ isAssignment cmd
 
 checkRedirectToSame _ _ = return ()
 
@@ -622,13 +796,11 @@ checkShorthandIf _ _ = return ()
 
 prop_checkDollarStar = verify checkDollarStar "for f in $*; do ..; done"
 prop_checkDollarStar2 = verifyNot checkDollarStar "a=$*"
-checkDollarStar p t@(T_NormalWord _ [b@(T_DollarBraced id _)])
-      | bracedString b == "*"  =
-    unless isAssigned $
-        warn id 2048 "Use \"$@\" (with quotes) to prevent whitespace problems."
-  where
-    path = getPath (parentMap p) t
-    isAssigned = any isAssignment . take 2 $ path
+prop_checkDollarStar3 = verifyNot checkDollarStar "[[ $* = 'a b' ]]"
+checkDollarStar p t@(T_NormalWord _ [T_DollarBraced id _ l])
+      | concat (oversimplify l) == "*" &&
+        not (isStrictlyQuoteFree (parentMap p) t) =
+            warn id 2048 "Use \"$@\" (with quotes) to prevent whitespace problems."
 checkDollarStar _ _ = return ()
 
 
@@ -642,15 +814,12 @@ prop_checkUnquotedDollarAt6 = verifyNot checkUnquotedDollarAt "a=$@"
 prop_checkUnquotedDollarAt7 = verify checkUnquotedDollarAt "for f in ${var[@]}; do true; done"
 prop_checkUnquotedDollarAt8 = verifyNot checkUnquotedDollarAt "echo \"${args[@]:+${args[@]}}\""
 prop_checkUnquotedDollarAt9 = verifyNot checkUnquotedDollarAt "echo ${args[@]:+\"${args[@]}\"}"
+prop_checkUnquotedDollarAt10 = verifyNot checkUnquotedDollarAt "echo ${@+\"$@\"}"
 checkUnquotedDollarAt p word@(T_NormalWord _ parts) | not $ isStrictlyQuoteFree (parentMap p) word =
-    forM_ (take 1 $ filter isArrayExpansion parts) $ \x ->
-        unless (isAlternative x) $
+    forM_ (find isArrayExpansion parts) $ \x ->
+        unless (isQuotedAlternativeReference x) $
             err (getId x) 2068
                 "Double quote array expansions to avoid re-splitting elements."
-  where
-    -- Fixme: should detect whether the alternative is quoted
-    isAlternative b@(T_DollarBraced _ t) = ":+" `isInfixOf` bracedString b
-    isAlternative _ = False
 checkUnquotedDollarAt _ _ = return ()
 
 prop_checkConcatenatedDollarAt1 = verify checkConcatenatedDollarAt "echo \"foo$@\""
@@ -658,13 +827,13 @@ prop_checkConcatenatedDollarAt2 = verify checkConcatenatedDollarAt "echo ${arr[@
 prop_checkConcatenatedDollarAt3 = verify checkConcatenatedDollarAt "echo $a$@"
 prop_checkConcatenatedDollarAt4 = verifyNot checkConcatenatedDollarAt "echo $@"
 prop_checkConcatenatedDollarAt5 = verifyNot checkConcatenatedDollarAt "echo \"${arr[@]}\""
-checkConcatenatedDollarAt p word@(T_NormalWord {})
-    | not $ isQuoteFree (parentMap p) word =
-        unless (null $ drop 1 parts) $
-            mapM_ for array
+checkConcatenatedDollarAt p word@T_NormalWord {}
+    | not $ isQuoteFree (parentMap p) word
+    || null (drop 1 parts) =
+        mapM_ for array
   where
     parts = getWordParts word
-    array = take 1 $ filter isArrayExpansion parts
+    array = find isArrayExpansion parts
     for t = err (getId t) 2145 "Argument mixes string and array. Use * or separate argument."
 checkConcatenatedDollarAt _ _ = return ()
 
@@ -694,11 +863,14 @@ prop_checkArrayWithoutIndex5 = verifyTree checkArrayWithoutIndex "a[0]=foo; echo
 prop_checkArrayWithoutIndex6 = verifyTree checkArrayWithoutIndex "echo $PIPESTATUS"
 prop_checkArrayWithoutIndex7 = verifyTree checkArrayWithoutIndex "a=(a b); a+=c"
 prop_checkArrayWithoutIndex8 = verifyTree checkArrayWithoutIndex "declare -a foo; foo=bar;"
+prop_checkArrayWithoutIndex9 = verifyTree checkArrayWithoutIndex "read -r -a arr <<< 'foo bar'; echo \"$arr\""
+prop_checkArrayWithoutIndex10 = verifyTree checkArrayWithoutIndex "read -ra arr <<< 'foo bar'; echo \"$arr\""
+prop_checkArrayWithoutIndex11 = verifyNotTree checkArrayWithoutIndex "read -rpfoobar r; r=42"
 checkArrayWithoutIndex params _ =
     doVariableFlowAnalysis readF writeF defaultMap (variableFlow params)
   where
     defaultMap = Map.fromList $ map (\x -> (x,())) arrayVariables
-    readF _ (T_DollarBraced id token) _ = do
+    readF _ (T_DollarBraced id _ token) _ = do
         map <- get
         return . maybeToList $ do
             name <- getLiteralString token
@@ -708,7 +880,7 @@ checkArrayWithoutIndex params _ =
     readF _ _ _ = return []
 
     writeF _ (T_Assignment id mode name [] _) _ (DataString _) = do
-        isArray <- gets (isJust . Map.lookup name)
+        isArray <- gets (Map.member name)
         return $ if not isArray then [] else
             case mode of
                 Assign -> [makeComment WarningC id 2178 "Variable was used as an array but is now assigned a string."]
@@ -734,6 +906,7 @@ prop_checkStderrRedirect3 = verifyNot checkStderrRedirect "test 2>&1 > file | gr
 prop_checkStderrRedirect4 = verifyNot checkStderrRedirect "errors=$(test 2>&1 > file)"
 prop_checkStderrRedirect5 = verifyNot checkStderrRedirect "read < <(test 2>&1 > file)"
 prop_checkStderrRedirect6 = verify checkStderrRedirect "foo | bar 2>&1 > /dev/null"
+prop_checkStderrRedirect7 = verifyNot checkStderrRedirect "{ cmd > file; } 2>&1"
 checkStderrRedirect params redir@(T_Redirecting _ [
     T_FdRedirect id "2" (T_IoDuplicate _ (T_GREATAND _) "1"),
     T_FdRedirect _ _ (T_IoFile _ op _)
@@ -752,7 +925,7 @@ checkStderrRedirect params redir@(T_Redirecting _ [
     isCaptured = any usesOutput $ getPath (parentMap params) redir
 
     error = unless isCaptured $
-        err id 2069 "The order of the 2>&1 and the redirect matters. The 2>&1 has to be last."
+        warn id 2069 "To redirect stdout+stderr, 2>&1 must be last (or use '{ cmd > file; } 2>&1' to clarify)."
 
 checkStderrRedirect _ _ = return ()
 
@@ -777,6 +950,20 @@ prop_checkSingleQuotedVariables10= verify checkSingleQuotedVariables "echo '`pwd
 prop_checkSingleQuotedVariables11= verifyNot checkSingleQuotedVariables "sed '${/lol/d}'"
 prop_checkSingleQuotedVariables12= verifyNot checkSingleQuotedVariables "eval 'echo $1'"
 prop_checkSingleQuotedVariables13= verifyNot checkSingleQuotedVariables "busybox awk '{print $1}'"
+prop_checkSingleQuotedVariables14= verifyNot checkSingleQuotedVariables "[ -v 'bar[$foo]' ]"
+prop_checkSingleQuotedVariables15= verifyNot checkSingleQuotedVariables "git filter-branch 'test $GIT_COMMIT'"
+prop_checkSingleQuotedVariables16= verify checkSingleQuotedVariables "git '$a'"
+prop_checkSingleQuotedVariables17= verifyNot checkSingleQuotedVariables "rename 's/(.)a/$1/g' *"
+prop_checkSingleQuotedVariables18= verifyNot checkSingleQuotedVariables "echo '``'"
+prop_checkSingleQuotedVariables19= verifyNot checkSingleQuotedVariables "echo '```'"
+prop_checkSingleQuotedVariables20= verifyNot checkSingleQuotedVariables "mumps -run %XCMD 'W $O(^GLOBAL(5))'"
+prop_checkSingleQuotedVariables21= verifyNot checkSingleQuotedVariables "mumps -run LOOP%XCMD --xec 'W $O(^GLOBAL(6))'"
+prop_checkSingleQuotedVariables22= verifyNot checkSingleQuotedVariables "jq '$__loc__'"
+prop_checkSingleQuotedVariables23= verifyNot checkSingleQuotedVariables "command jq '$__loc__'"
+prop_checkSingleQuotedVariables24= verifyNot checkSingleQuotedVariables "exec jq '$__loc__'"
+prop_checkSingleQuotedVariables25= verifyNot checkSingleQuotedVariables "exec -c -a foo jq '$__loc__'"
+
+
 checkSingleQuotedVariables params t@(T_SingleQuoted id s) =
     when (s `matches` re) $
         if "sed" == commandName
@@ -789,7 +976,7 @@ checkSingleQuotedVariables params t@(T_SingleQuoted id s) =
     commandName = fromMaybe "" $ do
         cmd <- getClosestCommand parents t
         name <- getCommandBasename cmd
-        return $ if name == "find" then getFindCommand cmd else name
+        return $ if name == "find" then getFindCommand cmd else if name == "git" then getGitCommand cmd else if name == "mumps" then getMumpsCommand cmd else name
 
     isProbablyOk =
             any isOkAssignment (take 3 $ getPath parents t)
@@ -804,8 +991,14 @@ checkSingleQuotedVariables params t@(T_SingleQuoted id s) =
                 ,"xprop"
                 ,"alias"
                 ,"sudo" -- covering "sudo sh" and such
+                ,"docker" -- like above
                 ,"dpkg-query"
                 ,"jq"  -- could also check that user provides --arg
+                ,"rename"
+                ,"unset"
+                ,"git filter-branch"
+                ,"mumps -run %XCMD"
+                ,"mumps -run LOOP%XCMD"
                 ]
             || "awk" `isSuffixOf` commandName
             || "perl" `isPrefixOf` commandName
@@ -814,9 +1007,10 @@ checkSingleQuotedVariables params t@(T_SingleQuoted id s) =
     isOkAssignment t =
         case t of
             T_Assignment _ _ name _ _ -> name `elem` commonlyQuoted
+            TC_Unary _ _ "-v" _ -> True
             _ -> False
 
-    re = mkRegex "\\$[{(0-9a-zA-Z_]|`.*`"
+    re = mkRegex "\\$[{(0-9a-zA-Z_]|`[^`]+`"
     sedContra = mkRegex "\\$[{dpsaic]($|[^a-zA-Z])"
 
     getFindCommand (T_SimpleCommand _ _ words) =
@@ -828,6 +1022,19 @@ checkSingleQuotedVariables params t@(T_SingleQuoted id s) =
             _ -> "find"
     getFindCommand (T_Redirecting _ _ cmd) = getFindCommand cmd
     getFindCommand _ = "find"
+    getGitCommand (T_SimpleCommand _ _ words) =
+        case map getLiteralString words of
+            Just "git":Just "filter-branch":_ -> "git filter-branch"
+            _ -> "git"
+    getGitCommand (T_Redirecting _ _ cmd) = getGitCommand cmd
+    getGitCommand _ = "git"
+    getMumpsCommand (T_SimpleCommand _ _ words) =
+        case map getLiteralString words of
+            Just "mumps":Just "-run":Just "%XCMD":_ -> "mumps -run %XCMD"
+            Just "mumps":Just "-run":Just "LOOP%XCMD":_ -> "mumps -run LOOP%XCMD"
+            _ -> "mumps"
+    getMumpsCommand (T_Redirecting _ _ cmd) = getMumpsCommand cmd
+    getMumpsCommand _ = "mumps"
 checkSingleQuotedVariables _ _ = return ()
 
 
@@ -835,8 +1042,10 @@ prop_checkUnquotedN = verify checkUnquotedN "if [ -n $foo ]; then echo cow; fi"
 prop_checkUnquotedN2 = verify checkUnquotedN "[ -n $cow ]"
 prop_checkUnquotedN3 = verifyNot checkUnquotedN "[[ -n $foo ]] && echo cow"
 prop_checkUnquotedN4 = verify checkUnquotedN "[ -n $cow -o -t 1 ]"
-checkUnquotedN _ (TC_Unary _ SingleBracket "-n" (T_NormalWord id [t])) | willSplit t =
-       err id 2070 "-n doesn't work with unquoted arguments. Quote or use [[ ]]."
+prop_checkUnquotedN5 = verifyNot checkUnquotedN "[ -n \"$@\" ]"
+checkUnquotedN _ (TC_Unary _ SingleBracket "-n" t) | willSplit t =
+    unless (any isArrayExpansion $ getWordParts t) $ -- There's SC2198 for these
+       err (getId t) 2070 "-n doesn't work with unquoted arguments. Quote or use [[ ]]."
 checkUnquotedN _ _ = return ()
 
 prop_checkNumberComparisons1 = verify checkNumberComparisons "[[ $foo < 3 ]]"
@@ -848,32 +1057,42 @@ prop_checkNumberComparisons6 = verify checkNumberComparisons "[[ 3.14 -eq $foo ]
 prop_checkNumberComparisons7 = verifyNot checkNumberComparisons "[[ 3.14 == $foo ]]"
 prop_checkNumberComparisons8 = verify checkNumberComparisons "[ foo <= bar ]"
 prop_checkNumberComparisons9 = verify checkNumberComparisons "[ foo \\>= bar ]"
-prop_checkNumberComparisons11= verify checkNumberComparisons "[ $foo -eq 'N' ]"
-prop_checkNumberComparisons12= verify checkNumberComparisons "[ x$foo -gt x${N} ]"
+prop_checkNumberComparisons11 = verify checkNumberComparisons "[ $foo -eq 'N' ]"
+prop_checkNumberComparisons12 = verify checkNumberComparisons "[ x$foo -gt x${N} ]"
+prop_checkNumberComparisons13 = verify checkNumberComparisons "[ $foo > $bar ]"
+prop_checkNumberComparisons14 = verifyNot checkNumberComparisons "[[ foo < bar ]]"
+prop_checkNumberComparisons15 = verifyNot checkNumberComparisons "[ $foo '>' $bar ]"
+prop_checkNumberComparisons16 = verify checkNumberComparisons "[ foo -eq 'y' ]"
 checkNumberComparisons params (TC_Binary id typ op lhs rhs) = do
-    if isNum lhs && not (isNonNum rhs)
-       || isNum rhs && not (isNonNum lhs)
+    if isNum lhs || isNum rhs
       then do
         when (isLtGt op) $
           err id 2071 $
             op ++ " is for string comparisons. Use " ++ eqv op ++ " instead."
-        when (isLeGe op) $
+        when (isLeGe op && hasStringComparison) $
             err id 2071 $ op ++ " is not a valid operator. " ++
               "Use " ++ eqv op ++ " ."
       else do
         when (isLeGe op || isLtGt op) $
             mapM_ checkDecimals [lhs, rhs]
 
-        when (isLeGe op) $
+        when (isLeGe op && hasStringComparison) $
             err id 2122 $ op ++ " is not a valid operator. " ++
-                "Use '! a " ++ invert op ++ " b' instead."
+                "Use '! a " ++ esc ++ invert op ++ " b' instead."
 
-    when (op `elem` ["-lt", "-gt", "-le", "-ge", "-eq"]) $ do
+        when (typ == SingleBracket && op `elem` ["<", ">"]) $
+            case shellType params of
+                Sh -> return ()  -- These are unsupported and will be caught by bashism checks.
+                Dash -> err id 2073 $ "Escape \\" ++ op ++ " to prevent it redirecting."
+                _ -> err id 2073 $ "Escape \\" ++ op ++ " to prevent it redirecting (or switch to [[ .. ]])."
+
+    when (op `elem` arithmeticBinaryTestOps) $ do
         mapM_ checkDecimals [lhs, rhs]
         when (typ == SingleBracket) $
             checkStrings [lhs, rhs]
 
   where
+      hasStringComparison = shellType params /= Sh
       isLtGt = flip elem ["<", "\\<", ">", "\\>"]
       isLeGe = flip elem ["<=", "\\<=", ">=", "\\>="]
 
@@ -883,12 +1102,10 @@ checkNumberComparisons params (TC_Binary id typ op lhs rhs) = do
       decimalError = "Decimals are not supported. " ++
         "Either use integers only, or use bc or awk to compare."
 
-      checkStrings hs =
-        mapM_ stringError . take 1 . filter isNonNum $ hs
+      checkStrings =
+        mapM_ stringError . find isNonNum
 
-      isNonNum t = fromMaybe False $ do
-        s <- getLiteralStringExt (const $ return "") t
-        return . not . all numChar $ s
+      isNonNum t = not . all numChar $ onlyLiteralString t
       numChar x = isDigit x || x `elem` "+-. "
 
       stringError t = err (getId t) 2170 $
@@ -923,26 +1140,19 @@ checkNumberComparisons params (TC_Binary id typ op lhs rhs) = do
       invert "<=" = ">"
       invert ">=" = "<"
 
-      floatRegex = mkRegex "^[0-9]+\\.[0-9]+$"
+      floatRegex = mkRegex "^[-+]?[0-9]+\\.[0-9]+$"
 checkNumberComparisons _ _ = return ()
 
 prop_checkSingleBracketOperators1 = verify checkSingleBracketOperators "[ test =~ foo ]"
-prop_checkSingleBracketOperators2 = verify checkSingleBracketOperators "[ $foo > $bar ]"
-prop_checkSingleBracketOperators3 = verifyNot checkSingleBracketOperators "[[ foo < bar ]]"
-prop_checkSingleBracketOperators5 = verify checkSingleBracketOperators "until [ $n <= $z ]; do echo foo; done"
-prop_checkSingleBracketOperators6 = verifyNot checkSingleBracketOperators "[ $foo '>' $bar ]"
-checkSingleBracketOperators _ (TC_Binary id typ op lhs rhs)
-    | typ == SingleBracket && op `elem` ["<", ">", "<=", ">="] =
-        err id 2073 $ "Can't use " ++ op ++" in [ ]. Escape it or use [[..]]."
-checkSingleBracketOperators _ (TC_Binary id typ op lhs rhs)
-    | typ == SingleBracket && op == "=~" =
-        err id 2074 $ "Can't use " ++ op ++" in [ ]. Use [[..]] instead."
+checkSingleBracketOperators params (TC_Binary id SingleBracket "=~" lhs rhs)
+    | shellType params `elem` [Bash, Ksh] =
+        err id 2074 $ "Can't use =~ in [ ]. Use [[..]] instead."
 checkSingleBracketOperators _ _ = return ()
 
 prop_checkDoubleBracketOperators1 = verify checkDoubleBracketOperators "[[ 3 \\< 4 ]]"
 prop_checkDoubleBracketOperators3 = verifyNot checkDoubleBracketOperators "[[ foo < bar ]]"
 checkDoubleBracketOperators _ x@(TC_Binary id typ op lhs rhs)
-    | typ == DoubleBracket && op `elem` ["\\<", "\\>", "\\<=", "\\>="] =
+    | typ == DoubleBracket && op `elem` ["\\<", "\\>"] =
         err id 2075 $ "Escaping " ++ op ++" is required in [..], but invalid in [[..]]"
 checkDoubleBracketOperators _ _ = return ()
 
@@ -967,7 +1177,7 @@ checkConditionalAndOrs _ t =
         (TC_Or id SingleBracket "-o" _ _) ->
             warn id 2166 "Prefer [ p ] || [ q ] as [ p -o q ] is not well defined."
 
-        otherwise -> return ()
+        _ -> return ()
 
 prop_checkQuotedCondRegex1 = verify checkQuotedCondRegex "[[ $foo =~ \"bar.*\" ]]"
 prop_checkQuotedCondRegex2 = verify checkQuotedCondRegex "[[ $foo =~ '(cow|bar)' ]]"
@@ -984,7 +1194,7 @@ checkQuotedCondRegex _ (TC_Binary _ _ "=~" _ rhs) =
     error t =
         unless (isConstantNonRe t) $
             err (getId t) 2076
-                "Don't quote rhs of =~, it'll match literally rather than as a regex."
+                "Don't quote right-hand side of =~, it'll match literally rather than as a regex."
     re = mkRegex "[][*.+()|]"
     hasMetachars s = s `matches` re
     isConstantNonRe t = fromMaybe False $ do
@@ -994,13 +1204,16 @@ checkQuotedCondRegex _ _ = return ()
 
 prop_checkGlobbedRegex1 = verify checkGlobbedRegex "[[ $foo =~ *foo* ]]"
 prop_checkGlobbedRegex2 = verify checkGlobbedRegex "[[ $foo =~ f* ]]"
-prop_checkGlobbedRegex2a = verify checkGlobbedRegex "[[ $foo =~ \\#* ]]"
 prop_checkGlobbedRegex3 = verifyNot checkGlobbedRegex "[[ $foo =~ $foo ]]"
 prop_checkGlobbedRegex4 = verifyNot checkGlobbedRegex "[[ $foo =~ ^c.* ]]"
-checkGlobbedRegex _ (TC_Binary _ DoubleBracket "=~" _ rhs) =
-    let s = concat $ oversimplify rhs in
-        when (isConfusedGlobRegex s) $
-            warn (getId rhs) 2049 "=~ is for regex. Use == for globs."
+prop_checkGlobbedRegex5 = verifyNot checkGlobbedRegex "[[ $foo =~ \\* ]]"
+prop_checkGlobbedRegex6 = verifyNot checkGlobbedRegex "[[ $foo =~ (o*) ]]"
+prop_checkGlobbedRegex7 = verifyNot checkGlobbedRegex "[[ $foo =~ \\*foo ]]"
+prop_checkGlobbedRegex8 = verifyNot checkGlobbedRegex "[[ $foo =~ x\\* ]]"
+checkGlobbedRegex _ (TC_Binary _ DoubleBracket "=~" _ rhs)
+    | isConfusedGlobRegex s =
+        warn (getId rhs) 2049 "=~ is for regex, but this looks like a glob. Use = instead."
+    where s = concat $ oversimplify rhs
 checkGlobbedRegex _ _ = return ()
 
 
@@ -1014,13 +1227,16 @@ prop_checkConstantIfs6 = verifyNot checkConstantIfs "[[ a -ot b ]]"
 prop_checkConstantIfs7 = verifyNot checkConstantIfs "[ a -nt b ]"
 prop_checkConstantIfs8 = verifyNot checkConstantIfs "[[ ~foo == '~foo' ]]"
 prop_checkConstantIfs9 = verify checkConstantIfs "[[ *.png == [a-z] ]]"
+prop_checkConstantIfs10 = verifyNot checkConstantIfs "[[ ~me == ~+ ]]"
+prop_checkConstantIfs11 = verifyNot checkConstantIfs "[[ ~ == ~+ ]]"
+prop_checkConstantIfs12 = verify checkConstantIfs "[[ '~' == x ]]"
 checkConstantIfs _ (TC_Binary id typ op lhs rhs) | not isDynamic =
     if isConstant lhs && isConstant rhs
         then  warn id 2050 "This expression is constant. Did you forget the $ on a variable?"
         else checkUnmatchable id op lhs rhs
   where
     isDynamic =
-        op `elem` [ "-lt", "-gt", "-le", "-ge", "-eq", "-ne" ]
+        op `elem` arithmeticBinaryTestOps
             && typ == DoubleBracket
         || op `elem` [ "-nt", "-ot", "-ef"]
 
@@ -1038,7 +1254,7 @@ prop_checkLiteralBreakingTest6 = verify checkLiteralBreakingTest "[ -z $(true)z 
 prop_checkLiteralBreakingTest7 = verifyNot checkLiteralBreakingTest "[ -z $(true) ]"
 prop_checkLiteralBreakingTest8 = verifyNot checkLiteralBreakingTest "[ $(true)$(true) ]"
 prop_checkLiteralBreakingTest10 = verify checkLiteralBreakingTest "[ -z foo ]"
-checkLiteralBreakingTest _ t = potentially $
+checkLiteralBreakingTest _ t = sequence_ $
         case t of
             (TC_Nullary _ _ w@(T_NormalWord _ l)) -> do
                 guard . not $ isConstant w -- Covered by SC2078
@@ -1052,16 +1268,13 @@ checkLiteralBreakingTest _ t = potentially $
   where
     hasEquals = matchToken ('=' `elem`)
     isNonEmpty = matchToken (not . null)
-    matchToken m t = isJust $ do
-        str <- getLiteralString t
-        guard $ m str
-        return ()
+    matchToken m t = maybe False m (getLiteralString t)
 
     comparisonWarning list = do
-        token <- listToMaybe $ filter hasEquals list
+        token <- find hasEquals list
         return $ err (getId token) 2077 "You need spaces around the comparison operator."
     tautologyWarning t s = do
-        token <- listToMaybe $ filter isNonEmpty $ getWordParts t
+        token <- find isNonEmpty $ getWordParts t
         return $ err (getId token) 2157 s
 
 prop_checkConstantNullary = verify checkConstantNullary "[[ '$(foo)' ]]"
@@ -1086,7 +1299,7 @@ checkConstantNullary _ _ = return ()
 prop_checkForDecimals1 = verify checkForDecimals "((3.14*c))"
 prop_checkForDecimals2 = verify checkForDecimals "foo[1.2]=bar"
 prop_checkForDecimals3 = verifyNot checkForDecimals "declare -A foo; foo[1.2]=bar"
-checkForDecimals params t@(TA_Expansion id _) = potentially $ do
+checkForDecimals params t@(TA_Expansion id _) = sequence_ $ do
     guard $ not (hasFloatingPoint params)
     str <- getLiteralString t
     first <- str !!! 0
@@ -1115,30 +1328,31 @@ prop_checkArithmeticDeref10= verifyNot checkArithmeticDeref "(( a[\\$foo] ))"
 prop_checkArithmeticDeref11= verifyNot checkArithmeticDeref "a[$foo]=wee"
 prop_checkArithmeticDeref12= verify checkArithmeticDeref "for ((i=0; $i < 3; i)); do true; done"
 prop_checkArithmeticDeref13= verifyNot checkArithmeticDeref "(( $$ ))"
-checkArithmeticDeref params t@(TA_Expansion _ [b@(T_DollarBraced id _)]) =
-    unless (isException $ bracedString b) getWarning
+prop_checkArithmeticDeref14= verifyNot checkArithmeticDeref "(( $! ))"
+prop_checkArithmeticDeref15= verifyNot checkArithmeticDeref "(( ${!var} ))"
+prop_checkArithmeticDeref16= verifyNot checkArithmeticDeref "(( ${x+1} + ${x=42} ))"
+checkArithmeticDeref params t@(TA_Expansion _ [T_DollarBraced id _ l]) =
+    unless (isException $ concat $ oversimplify l) getWarning
   where
     isException [] = True
-    isException s = any (`elem` "/.:#%?*@$-") s || isDigit (head s)
+    isException s@(h:_) = any (`elem` "/.:#%?*@$-!+=^,") s || isDigit h
     getWarning = fromMaybe noWarning . msum . map warningFor $ parents params t
     warningFor t =
         case t of
             T_Arithmetic {} -> return normalWarning
             T_DollarArithmetic {} -> return normalWarning
             T_ForArithmetic {} -> return normalWarning
-            TA_Index {} -> return indexWarning
             T_SimpleCommand {} -> return noWarning
             _ -> Nothing
 
     normalWarning = style id 2004 "$/${} is unnecessary on arithmetic variables."
-    indexWarning = style id 2149 "Remove $/${} for numeric index, or escape it for string."
     noWarning = return ()
 checkArithmeticDeref _ _ = return ()
 
 prop_checkArithmeticBadOctal1 = verify checkArithmeticBadOctal "(( 0192 ))"
 prop_checkArithmeticBadOctal2 = verifyNot checkArithmeticBadOctal "(( 0x192 ))"
 prop_checkArithmeticBadOctal3 = verifyNot checkArithmeticBadOctal "(( 1 ^ 0777 ))"
-checkArithmeticBadOctal _ t@(TA_Expansion id _) = potentially $ do
+checkArithmeticBadOctal _ t@(TA_Expansion id _) = sequence_ $ do
     str <- getLiteralString t
     guard $ str `matches` octalRE
     return $ err id 2080 "Numbers with leading 0 are considered octal."
@@ -1151,13 +1365,34 @@ prop_checkComparisonAgainstGlob2 = verifyNot checkComparisonAgainstGlob "[[ $cow
 prop_checkComparisonAgainstGlob3 = verify checkComparisonAgainstGlob "[ $cow = *foo* ]"
 prop_checkComparisonAgainstGlob4 = verifyNot checkComparisonAgainstGlob "[ $cow = foo ]"
 prop_checkComparisonAgainstGlob5 = verify checkComparisonAgainstGlob "[[ $cow != $bar ]]"
-checkComparisonAgainstGlob _ (TC_Binary _ DoubleBracket op _ (T_NormalWord id [T_DollarBraced _ _]))
+prop_checkComparisonAgainstGlob6 = verify checkComparisonAgainstGlob "[ $f != /* ]"
+checkComparisonAgainstGlob _ (TC_Binary _ DoubleBracket op _ (T_NormalWord id [T_DollarBraced _ _ _]))
     | op `elem` ["=", "==", "!="] =
-        warn id 2053 $ "Quote the rhs of " ++ op ++ " in [[ ]] to prevent glob matching."
-checkComparisonAgainstGlob _ (TC_Binary _ SingleBracket op _ word)
-        | (op == "=" || op == "==") && isGlob word =
-    err (getId word) 2081 "[ .. ] can't match globs. Use [[ .. ]] or case statement."
+        warn id 2053 $ "Quote the right-hand side of " ++ op ++ " in [[ ]] to prevent glob matching."
+checkComparisonAgainstGlob params (TC_Binary _ SingleBracket op _ word)
+        | op `elem` ["=", "==", "!="] && isGlob word =
+    err (getId word) 2081 msg
+  where
+    msg = if isBashLike params
+            then "[ .. ] can't match globs. Use [[ .. ]] or case statement."
+            else "[ .. ] can't match globs. Use a case statement."
+
 checkComparisonAgainstGlob _ _ = return ()
+
+prop_checkCaseAgainstGlob1 = verify checkCaseAgainstGlob "case foo in lol$n) foo;; esac"
+prop_checkCaseAgainstGlob2 = verify checkCaseAgainstGlob "case foo in $(foo)) foo;; esac"
+prop_checkCaseAgainstGlob3 = verifyNot checkCaseAgainstGlob "case foo in *$bar*) foo;; esac"
+checkCaseAgainstGlob _ t =
+    case t of
+        (T_CaseExpression _ _ cases) -> mapM_ check cases
+        _ -> return ()
+  where
+    check (_, list, _) = mapM_ check' list
+    check' expr@(T_NormalWord _ list)
+        -- If it's already a glob, assume that's what the user wanted
+        | not (isGlob expr) && any isQuoteableExpansion list =
+            warn (getId expr) 2254 "Quote expansions in case patterns to match literally rather than as a glob."
+    check' _ = return ()
 
 prop_checkCommarrays1 = verify checkCommarrays "a=(1, 2)"
 prop_checkCommarrays2 = verify checkCommarrays "a+=(1,2,3)"
@@ -1165,6 +1400,7 @@ prop_checkCommarrays3 = verifyNot checkCommarrays "cow=(1 \"foo,bar\" 3)"
 prop_checkCommarrays4 = verifyNot checkCommarrays "cow=('one,' 'two')"
 prop_checkCommarrays5 = verify checkCommarrays "a=([a]=b, [c]=d)"
 prop_checkCommarrays6 = verify checkCommarrays "a=([a]=b,[c]=d,[e]=f)"
+prop_checkCommarrays7 = verify checkCommarrays "a=(1,2)"
 checkCommarrays _ (T_Array id l) =
     when (any (isCommaSeparated . literal) l) $
         warn id 2054 "Use spaces, not commas, to separate array elements."
@@ -1172,9 +1408,9 @@ checkCommarrays _ (T_Array id l) =
     literal (T_IndexedElement _ _ l) = literal l
     literal (T_NormalWord _ l) = concatMap literal l
     literal (T_Literal _ str) = str
-    literal _ = "str"
+    literal _ = ""
 
-    isCommaSeparated str = "," `isSuffixOf` str || length (filter (== ',') str) > 1
+    isCommaSeparated = elem ','
 checkCommarrays _ _ = return ()
 
 prop_checkOrNeq1 = verify checkOrNeq "if [[ $lol -ne cow || $lol -ne foo ]]; then echo foo; fi"
@@ -1182,14 +1418,48 @@ prop_checkOrNeq2 = verify checkOrNeq "(( a!=lol || a!=foo ))"
 prop_checkOrNeq3 = verify checkOrNeq "[ \"$a\" != lol || \"$a\" != foo ]"
 prop_checkOrNeq4 = verifyNot checkOrNeq "[ a != $cow || b != $foo ]"
 prop_checkOrNeq5 = verifyNot checkOrNeq "[[ $a != /home || $a != */public_html/* ]]"
+prop_checkOrNeq6 = verify checkOrNeq "[ $a != a ] || [ $a != b ]"
+prop_checkOrNeq7 = verify checkOrNeq "[ $a != a ] || [ $a != b ] || true"
+prop_checkOrNeq8 = verifyNot checkOrNeq "[[ $a != x || $a != x ]]"
+prop_checkOrNeq9 = verifyNot checkOrNeq "[ 0 -ne $FOO ] || [ 0 -ne $BAR ]"
 -- This only catches the most idiomatic cases. Fixme?
-checkOrNeq _ (TC_Or id typ op (TC_Binary _ _ op1 lhs1 rhs1 ) (TC_Binary _ _ op2 lhs2 rhs2))
-    | lhs1 == lhs2 && (op1 == op2 && (op1 == "-ne" || op1 == "!=")) && not (any isGlob [rhs1,rhs2]) =
-        warn id 2055 $ "You probably wanted " ++ (if typ == SingleBracket then "-a" else "&&") ++ " here."
 
+-- For test-level "or": [ x != y -o x != z ]
+checkOrNeq _ (TC_Or id typ op (TC_Binary _ _ op1 lhs1 rhs1 ) (TC_Binary _ _ op2 lhs2 rhs2))
+    | (op1 == op2 && (op1 == "-ne" || op1 == "!=")) && lhs1 == lhs2 && rhs1 /= rhs2 && not (any isGlob [rhs1,rhs2]) =
+        warn id 2055 $ "You probably wanted " ++ (if typ == SingleBracket then "-a" else "&&") ++ " here, otherwise it's always true."
+
+-- For arithmetic context "or"
 checkOrNeq _ (TA_Binary id "||" (TA_Binary _ "!=" word1 _) (TA_Binary _ "!=" word2 _))
     | word1 == word2 =
-        warn id 2056 "You probably wanted && here."
+        warn id 2056 "You probably wanted && here, otherwise it's always true."
+
+-- For command level "or": [ x != y ] || [ x != z ]
+checkOrNeq _ (T_OrIf id lhs rhs) = sequence_ $ do
+    (lhs1, op1, rhs1) <- getExpr lhs
+    (lhs2, op2, rhs2) <- getExpr rhs
+    guard $ op1 == op2 && op1 `elem` ["-ne", "!="]
+    guard $ lhs1 == lhs2 && rhs1 /= rhs2
+    guard . not $ any isGlob [rhs1, rhs2]
+    return $ warn id 2252 "You probably wanted && here, otherwise it's always true."
+  where
+    getExpr x =
+        case x of
+            T_OrIf _ lhs _ -> getExpr lhs -- Fetches x and y in `T_OrIf x (T_OrIf y z)`
+            T_Pipeline _ _ [x] -> getExpr x
+            T_Redirecting _ _ c -> getExpr c
+            T_Condition _ _ c -> getExpr c
+            TC_Binary _ _ op lhs rhs -> orient (lhs, op, rhs)
+            _ -> Nothing
+
+    -- Swap items so that the constant side is rhs (or Nothing if both/neither is constant)
+    orient (lhs, op, rhs) =
+        case (isConstant lhs, isConstant rhs) of
+            (True, False) -> return (rhs, op, lhs)
+            (False, True) -> return (lhs, op, rhs)
+            _ -> Nothing
+
+
 checkOrNeq _ _ = return ()
 
 
@@ -1238,7 +1508,7 @@ checkUuoeVar _ p =
             unless (isCovered first rest || "-" `isPrefixOf` onlyLiteralString first) $
                 when (all couldBeOptimized vars) $ style id 2116
                     "Useless echo? Instead of 'cmd $(echo foo)', just use 'cmd foo'."
-          otherwise -> return ()
+          _ -> return ()
 
 
 prop_checkTestRedirects1 = verify checkTestRedirects "test 3 > 1"
@@ -1254,40 +1524,13 @@ checkTestRedirects _ (T_Redirecting id redirs cmd) | cmd `isCommand` "test" =
     suspicious t = -- Ignore redirections of stderr because these are valid for squashing e.g. int errors,
         case t of  -- and >> and similar redirections because these are probably not comparisons.
             T_FdRedirect _ fd (T_IoFile _ op _) -> fd /= "2" && isComparison op
-            otherwise -> False
+            _ -> False
     isComparison t =
         case t of
             T_Greater _ -> True
             T_Less _ -> True
-            otherwise -> False
+            _ -> False
 checkTestRedirects _ _ = return ()
-
-prop_checkSudoRedirect1 = verify checkSudoRedirect "sudo echo 3 > /proc/file"
-prop_checkSudoRedirect2 = verify checkSudoRedirect "sudo cmd < input"
-prop_checkSudoRedirect3 = verify checkSudoRedirect "sudo cmd >> file"
-prop_checkSudoRedirect4 = verify checkSudoRedirect "sudo cmd &> file"
-prop_checkSudoRedirect5 = verifyNot checkSudoRedirect "sudo cmd 2>&1"
-prop_checkSudoRedirect6 = verifyNot checkSudoRedirect "sudo cmd 2> log"
-prop_checkSudoRedirect7 = verifyNot checkSudoRedirect "sudo cmd > /dev/null 2>&1"
-checkSudoRedirect _ (T_Redirecting _ redirs cmd) | cmd `isCommand` "sudo" =
-    mapM_ warnAbout redirs
-  where
-    warnAbout (T_FdRedirect _ s (T_IoFile id op file))
-        | (s == "" || s == "&") && not (special file) =
-        case op of
-            T_Less _ ->
-              info (getId op) 2024
-                "sudo doesn't affect redirects. Use sudo cat file | .."
-            T_Greater _ ->
-              warn (getId op) 2024
-                "sudo doesn't affect redirects. Use ..| sudo tee file"
-            T_DGREAT _ ->
-              warn (getId op) 2024
-                "sudo doesn't affect redirects. Use .. | sudo tee -a file"
-            _ -> return ()
-    warnAbout _ = return ()
-    special file = concat (oversimplify file) == "/dev/null"
-checkSudoRedirect _ _ = return ()
 
 prop_checkPS11 = verify checkPS1Assignments "PS1='\\033[1;35m\\$ '"
 prop_checkPS11a= verify checkPS1Assignments "export PS1='\\033[1;35m\\$ '"
@@ -1315,8 +1558,10 @@ checkPS1Assignments _ _ = return ()
 prop_checkBackticks1 = verify checkBackticks "echo `foo`"
 prop_checkBackticks2 = verifyNot checkBackticks "echo $(foo)"
 prop_checkBackticks3 = verifyNot checkBackticks "echo `#inlined comment` foo"
-checkBackticks _ (T_Backticked id list) | not (null list) =
-    style id 2006 "Use $(..) instead of legacy `..`."
+checkBackticks params (T_Backticked id list) | not (null list) =
+    addComment $
+        makeCommentWithFix StyleC id 2006  "Use $(...) notation instead of legacy backticked `...`."
+            (fixWith [replaceStart id params 1 "$(", replaceEnd id params 1 ")"])
 checkBackticks _ _ = return ()
 
 prop_checkIndirectExpansion1 = verify checkIndirectExpansion "${foo$n}"
@@ -1324,8 +1569,8 @@ prop_checkIndirectExpansion2 = verifyNot checkIndirectExpansion "${foo//$n/lol}"
 prop_checkIndirectExpansion3 = verify checkIndirectExpansion "${$#}"
 prop_checkIndirectExpansion4 = verify checkIndirectExpansion "${var${n}_$((i%2))}"
 prop_checkIndirectExpansion5 = verifyNot checkIndirectExpansion "${bar}"
-checkIndirectExpansion _ (T_DollarBraced i (T_NormalWord _ contents)) =
-    when (isIndirection contents) $
+checkIndirectExpansion _ (T_DollarBraced i _ (T_NormalWord _ contents))
+    | isIndirection contents =
         err i 2082 "To expand via indirection, use arrays, ${!name} or (for sh only) eval."
   where
     isIndirection vars =
@@ -1334,7 +1579,7 @@ checkIndirectExpansion _ (T_DollarBraced i (T_NormalWord _ contents)) =
     isIndirectionPart t =
         case t of T_DollarExpansion _ _ ->  Just True
                   T_Backticked _ _ ->       Just True
-                  T_DollarBraced _ _ ->     Just True
+                  T_DollarBraced _ _ _ ->     Just True
                   T_DollarArithmetic _ _ -> Just True
                   T_Literal _ s -> if all isVariableChar s
                                     then Nothing
@@ -1350,28 +1595,39 @@ prop_checkInexplicablyUnquoted4 = verify checkInexplicablyUnquoted "echo \"VALUE
 prop_checkInexplicablyUnquoted5 = verifyNot checkInexplicablyUnquoted "\"$dir\"/\"$file\""
 prop_checkInexplicablyUnquoted6 = verifyNot checkInexplicablyUnquoted "\"$dir\"some_stuff\"$file\""
 prop_checkInexplicablyUnquoted7 = verifyNot checkInexplicablyUnquoted "${dir/\"foo\"/\"bar\"}"
-checkInexplicablyUnquoted _ (T_NormalWord id tokens) = mapM_ check (tails tokens)
+prop_checkInexplicablyUnquoted8 = verifyNot checkInexplicablyUnquoted "  'foo'\\\n  'bar'"
+prop_checkInexplicablyUnquoted9 = verifyNot checkInexplicablyUnquoted "[[ $x =~ \"foo\"(\"bar\"|\"baz\") ]]"
+checkInexplicablyUnquoted params (T_NormalWord id tokens) = mapM_ check (tails tokens)
   where
     check (T_SingleQuoted _ _:T_Literal id str:_)
-        | all isAlphaNum str =
+        | not (null str) && all isAlphaNum str =
         info id 2026 "This word is outside of quotes. Did you intend to 'nest '\"'single quotes'\"' instead'? "
 
     check (T_DoubleQuoted _ a:trapped:T_DoubleQuoted _ b:_) =
         case trapped of
             T_DollarExpansion id _ -> warnAboutExpansion id
-            T_DollarBraced id _ -> warnAboutExpansion id
-            T_Literal id s ->
-                unless (quotesSingleThing a && quotesSingleThing b) $
+            T_DollarBraced id _ _ -> warnAboutExpansion id
+            T_Literal id s
+                | not (quotesSingleThing a && quotesSingleThing b || isRegex (getPath (parentMap params) trapped)) ->
                     warnAboutLiteral id
             _ -> return ()
 
     check _ = return ()
 
+    -- Regexes for [[ .. =~ re ]] are parsed with metacharacters like ()| as unquoted
+    -- literals, so avoid overtriggering on these.
+    isRegex t =
+        case t of
+            (T_Redirecting {} : _) -> False
+            (a:(TC_Binary _ _ "=~" lhs rhs):rest) -> getId a == getId rhs
+            _:rest -> isRegex rest
+            _ -> False
+
     -- If the surrounding quotes quote single things, like "$foo"_and_then_some_"$stuff",
     -- the quotes were probably intentional and harmless.
     quotesSingleThing x = case x of
         [T_DollarExpansion _ _] -> True
-        [T_DollarBraced _ _] -> True
+        [T_DollarBraced _ _ _] -> True
         [T_Backticked _ _] -> True
         _ -> False
 
@@ -1411,17 +1667,19 @@ prop_checkSpuriousExec4 = verifyNot checkSpuriousExec "if a; then exec b; fi"
 prop_checkSpuriousExec5 = verifyNot checkSpuriousExec "exec > file; cmd"
 prop_checkSpuriousExec6 = verify checkSpuriousExec "exec foo > file; cmd"
 prop_checkSpuriousExec7 = verifyNot checkSpuriousExec "exec file; echo failed; exit 3"
+prop_checkSpuriousExec8 = verifyNot checkSpuriousExec "exec {origout}>&1- >tmp.log 2>&1; bar"
+prop_checkSpuriousExec9 = verify checkSpuriousExec "for file in rc.d/*; do exec \"$file\"; done"
 checkSpuriousExec _ = doLists
   where
-    doLists (T_Script _ _ cmds) = doList cmds
-    doLists (T_BraceGroup _ cmds) = doList cmds
-    doLists (T_WhileExpression _ _ cmds) = doList cmds
-    doLists (T_UntilExpression _ _ cmds) = doList cmds
-    doLists (T_ForIn _ _ _ cmds) = doList cmds
-    doLists (T_ForArithmetic _ _ _ _ cmds) = doList cmds
+    doLists (T_Script _ _ cmds) = doList cmds False
+    doLists (T_BraceGroup _ cmds) = doList cmds False
+    doLists (T_WhileExpression _ _ cmds) = doList cmds True
+    doLists (T_UntilExpression _ _ cmds) = doList cmds True
+    doLists (T_ForIn _ _ _ cmds) = doList cmds True
+    doLists (T_ForArithmetic _ _ _ _ cmds) = doList cmds True
     doLists (T_IfExpression _ thens elses) = do
-        mapM_ (\(_, l) -> doList l) thens
-        doList elses
+        mapM_ (\(_, l) -> doList l False) thens
+        doList elses False
     doLists _ = return ()
 
     stripCleanup = reverse . dropWhile cleanup . reverse
@@ -1430,35 +1688,35 @@ checkSpuriousExec _ = doLists
     cleanup _ = False
 
     doList = doList' . stripCleanup
-    doList' t@(current:following:_) = do
+    -- The second parameter is True if we are in a loop
+    -- In that case we should emit the warning also if `exec' is the last statement
+    doList' (current:t@(following:_)) False = do
         commentIfExec current
-        doList (tail t)
-    doList' _ = return ()
+        doList t False
+    doList' (current:tail) True = do
+        commentIfExec current
+        doList tail True
+    doList' _ _ = return ()
 
-    commentIfExec (T_Pipeline id _ list) =
-      mapM_ commentIfExec $ take 1 list
-    commentIfExec (T_Redirecting _ _ f@(
-      T_SimpleCommand id _ (cmd:arg:_))) =
-        when (f `isUnqualifiedCommand` "exec") $
-          warn id 2093
-            "Remove \"exec \" if script should continue after this command."
+    commentIfExec (T_Pipeline id _ [c]) = commentIfExec c
+    commentIfExec (T_Redirecting _ _ (T_SimpleCommand id _ (cmd:additionalArg:_))) |
+        getLiteralString cmd == Just "exec" =
+            warn id 2093 "Remove \"exec \" if script should continue after this command."
     commentIfExec _ = return ()
 
 
 prop_checkSpuriousExpansion1 = verify checkSpuriousExpansion "if $(true); then true; fi"
-prop_checkSpuriousExpansion2 = verify checkSpuriousExpansion "while \"$(cmd)\"; do :; done"
 prop_checkSpuriousExpansion3 = verifyNot checkSpuriousExpansion "$(cmd) --flag1 --flag2"
 prop_checkSpuriousExpansion4 = verify checkSpuriousExpansion "$((i++))"
 checkSpuriousExpansion _ (T_SimpleCommand _ _ [T_NormalWord _ [word]]) = check word
   where
     check word = case word of
         T_DollarExpansion id _ ->
-            warn id 2091 "Remove surrounding $() to avoid executing output."
+            warn id 2091 "Remove surrounding $() to avoid executing output (or use eval if intentional)."
         T_Backticked id _ ->
-            warn id 2092 "Remove backticks to avoid executing output."
+            warn id 2092 "Remove backticks to avoid executing output (or use eval if intentional)."
         T_DollarArithmetic id _ ->
             err id 2084 "Remove '$' or use '_=$((expr))' to avoid executing output."
-        T_DoubleQuoted id [subword] -> check subword
         _ -> return ()
 checkSpuriousExpansion _ _ = return ()
 
@@ -1502,10 +1760,12 @@ prop_subshellAssignmentCheck15 = verifyNotTree subshellAssignmentCheck "#!/bin/k
 prop_subshellAssignmentCheck16 = verifyNotTree subshellAssignmentCheck "(set -e); echo $@"
 prop_subshellAssignmentCheck17 = verifyNotTree subshellAssignmentCheck "foo=${ { bar=$(baz); } 2>&1; }; echo $foo $bar"
 prop_subshellAssignmentCheck18 = verifyTree subshellAssignmentCheck "( exec {n}>&2; ); echo $n"
+prop_subshellAssignmentCheck19 = verifyNotTree subshellAssignmentCheck "#!/bin/bash\nshopt -s lastpipe; echo a | read -r b; echo \"$b\""
+prop_subshellAssignmentCheck20 = verifyTree subshellAssignmentCheck "@test 'foo' { a=1; }\n@test 'bar' { echo $a; }\n"
 subshellAssignmentCheck params t =
     let flow = variableFlow params
         check = findSubshelled flow [("oops",[])] Map.empty
-    in snd $ runWriter check
+    in execWriter check
 
 
 findSubshelled [] _ _ = return ()
@@ -1585,38 +1845,99 @@ prop_checkSpacefulness30= verifyTree checkSpacefulness "file='foo bar'; echo foo
 prop_checkSpacefulness31= verifyNotTree checkSpacefulness "echo \"`echo \\\"$1\\\"`\""
 prop_checkSpacefulness32= verifyNotTree checkSpacefulness "var=$1; [ -v var ]"
 prop_checkSpacefulness33= verifyTree checkSpacefulness "for file; do echo $file; done"
+prop_checkSpacefulness34= verifyTree checkSpacefulness "declare foo$n=$1"
+prop_checkSpacefulness35= verifyNotTree checkSpacefulness "echo ${1+\"$1\"}"
+prop_checkSpacefulness36= verifyNotTree checkSpacefulness "arg=$#; echo $arg"
+prop_checkSpacefulness37= verifyNotTree checkSpacefulness "@test 'status' {\n [ $status -eq 0 ]\n}"
+prop_checkSpacefulness37v = verifyTree checkVerboseSpacefulness "@test 'status' {\n [ $status -eq 0 ]\n}"
+prop_checkSpacefulness38= verifyTree checkSpacefulness "a=; echo $a"
+prop_checkSpacefulness39= verifyNotTree checkSpacefulness "a=''\"\"''; b=x$a; echo $b"
+prop_checkSpacefulness40= verifyNotTree checkSpacefulness "a=$((x+1)); echo $a"
 
-checkSpacefulness params t =
+data SpaceStatus = SpaceSome | SpaceNone | SpaceEmpty deriving (Eq)
+instance Semigroup SpaceStatus where
+    SpaceNone <> SpaceNone = SpaceNone
+    SpaceSome <> _ = SpaceSome
+    _ <> SpaceSome = SpaceSome
+    SpaceEmpty <> x = x
+    x <> SpaceEmpty = x
+instance Monoid SpaceStatus where
+    mempty = SpaceEmpty
+    mappend = (<>)
+
+-- This is slightly awkward because we want to support structured
+-- optional checks based on nearly the same logic
+checkSpacefulness params = checkSpacefulness' onFind params
+  where
+    emit x = tell [x]
+    onFind spaces token _ =
+        when (spaces /= SpaceNone) $
+            if isDefaultAssignment (parentMap params) token
+            then
+                emit $ makeComment InfoC (getId token) 2223
+                         "This default assignment may cause DoS due to globbing. Quote it."
+            else
+                emit $ makeCommentWithFix InfoC (getId token) 2086
+                         "Double quote to prevent globbing and word splitting."
+                         (addDoubleQuotesAround params token)
+
+    isDefaultAssignment parents token =
+        let modifier = getBracedModifier $ bracedString token in
+            any (`isPrefixOf` modifier) ["=", ":="]
+            && isParamTo parents ":" token
+
+    -- Given a T_DollarBraced, return a simplified version of the string contents.
+    bracedString (T_DollarBraced _ _ l) = concat $ oversimplify l
+    bracedString _ = error "Internal shellcheck error, please report! (bracedString on non-variable)"
+
+prop_checkSpacefulness4v= verifyTree checkVerboseSpacefulness "foo=3; foo=$(echo $foo)"
+prop_checkSpacefulness8v= verifyTree checkVerboseSpacefulness "a=foo\\ bar; a=foo; rm $a"
+prop_checkSpacefulness28v = verifyTree checkVerboseSpacefulness "exec {n}>&1; echo $n"
+prop_checkSpacefulness36v = verifyTree checkVerboseSpacefulness "arg=$#; echo $arg"
+checkVerboseSpacefulness params = checkSpacefulness' onFind params
+  where
+    onFind spaces token name =
+        when (spaces == SpaceNone && name `notElem` specialVariablesWithoutSpaces) $
+            tell [makeCommentWithFix StyleC (getId token) 2248
+                    "Prefer double quoting even when variables don't contain special characters."
+                    (addDoubleQuotesAround params token)]
+
+addDoubleQuotesAround params token = (surroundWidth (getId token) params "\"")
+checkSpacefulness'
+    :: (SpaceStatus -> Token -> String -> Writer [TokenComment] ()) ->
+            Parameters -> Token -> [TokenComment]
+checkSpacefulness' onFind params t =
     doVariableFlowAnalysis readF writeF (Map.fromList defaults) (variableFlow params)
   where
-    defaults = zip variablesWithoutSpaces (repeat False)
+    defaults = zip variablesWithoutSpaces (repeat SpaceNone)
 
-    hasSpaces name = do
-        map <- get
-        return $ Map.findWithDefault True name map
+    hasSpaces name = gets (Map.findWithDefault SpaceSome name)
 
-    setSpaces name bool =
-        modify $ Map.insert name bool
+    setSpaces name status =
+        modify $ Map.insert name status
 
     readF _ token name = do
-        spaced <- hasSpaces name
-        return [makeComment InfoC (getId token) 2086 warning |
-                  isExpansion token && spaced
+        spaces <- hasSpaces name
+        let needsQuoting =
+                  isExpansion token
                   && not (isArrayExpansion token) -- There's another warning for this
-                  && not (isCounting token)
+                  && not (isCountingReference token)
                   && not (isQuoteFree parents token)
-                  && not (isQuotedAlternative token)
-                  && not (usedAsCommandName parents token)]
-      where
-        warning = "Double quote to prevent globbing and word splitting."
+                  && not (isQuotedAlternativeReference token)
+                  && not (usedAsCommandName parents token)
 
-    writeF _ _ name (DataString SourceExternal) = setSpaces name True >> return []
-    writeF _ _ name (DataString SourceInteger) = setSpaces name False >> return []
+        return . execWriter $ when needsQuoting $ onFind spaces token name
+
+      where
+        emit x = tell [x]
+
+    writeF _ _ name (DataString SourceExternal) = setSpaces name SpaceSome >> return []
+    writeF _ _ name (DataString SourceInteger) = setSpaces name SpaceNone >> return []
 
     writeF _ _ name (DataString (SourceFrom vals)) = do
         map <- get
         setSpaces name
-            (isSpacefulWord (\x -> Map.findWithDefault True x map) vals)
+            (isSpacefulWord (\x -> Map.findWithDefault SpaceSome x map) vals)
         return []
 
     writeF _ _ _ _ = return []
@@ -1625,40 +1946,46 @@ checkSpacefulness params t =
 
     isExpansion t =
         case t of
-            (T_DollarBraced _ _ ) -> True
+            (T_DollarBraced _ _ _ ) -> True
             _ -> False
 
-    isCounting (T_DollarBraced id token) =
-        case concat $ oversimplify token of
-            '#':_ -> True
-            _ -> False
-    isCounting _ = False
-
-    -- FIXME: doesn't handle ${a:+$var} vs ${a:+"$var"}
-    isQuotedAlternative t =
-        case t of
-            T_DollarBraced _ _ ->
-                ":+" `isInfixOf` bracedString t
-            _ -> False
-
-    isSpacefulWord :: (String -> Bool) -> [Token] -> Bool
-    isSpacefulWord f = any (isSpaceful f)
-    isSpaceful :: (String -> Bool) -> Token -> Bool
+    isSpacefulWord :: (String -> SpaceStatus) -> [Token] -> SpaceStatus
+    isSpacefulWord f = mconcat . map (isSpaceful f)
+    isSpaceful :: (String -> SpaceStatus) -> Token -> SpaceStatus
     isSpaceful spacefulF x =
         case x of
-          T_DollarExpansion _ _ -> True
-          T_Backticked _ _ -> True
-          T_Glob _ _         -> True
-          T_Extglob {}       -> True
-          T_Literal _ s      -> s `containsAny` globspace
-          T_SingleQuoted _ s -> s `containsAny` globspace
-          T_DollarBraced _ _ -> spacefulF $ getBracedReference $ bracedString x
+          T_DollarExpansion _ _ -> SpaceSome
+          T_Backticked _ _ -> SpaceSome
+          T_Glob _ _         -> SpaceSome
+          T_Extglob {}       -> SpaceSome
+          T_DollarArithmetic _ _ -> SpaceNone
+          T_Literal _ s      -> fromLiteral s
+          T_SingleQuoted _ s -> fromLiteral s
+          T_DollarBraced _ _ l -> spacefulF $ getBracedReference $ concat $ oversimplify l
           T_NormalWord _ w   -> isSpacefulWord spacefulF w
           T_DoubleQuoted _ w -> isSpacefulWord spacefulF w
-          _ -> False
+          _ -> SpaceEmpty
       where
         globspace = "*?[] \t\n"
         containsAny s = any (`elem` s)
+        fromLiteral "" = SpaceEmpty
+        fromLiteral s | s `containsAny` globspace = SpaceSome
+        fromLiteral _ = SpaceNone
+
+prop_CheckVariableBraces1 = verify checkVariableBraces "a='123'; echo $a"
+prop_CheckVariableBraces2 = verifyNot checkVariableBraces "a='123'; echo ${a}"
+prop_CheckVariableBraces3 = verifyNot checkVariableBraces "#shellcheck disable=SC2016\necho '$a'"
+prop_CheckVariableBraces4 = verifyNot checkVariableBraces "echo $* $1"
+checkVariableBraces params t@(T_DollarBraced id False l)
+    | name `notElem` unbracedVariables =
+        styleWithFix id 2250
+            "Prefer putting braces around variable references even when not strictly required."
+            (fixFor t)
+  where
+    name = getBracedReference $ concat $ oversimplify l
+    fixFor token = fixWith [replaceStart (getId token) params 1 "${"
+                           ,replaceEnd (getId token) params 0 "}"]
+checkVariableBraces _ _ = return ()
 
 prop_checkQuotesInLiterals1 = verifyTree checkQuotesInLiterals "param='--foo=\"bar\"'; app $param"
 prop_checkQuotesInLiterals1a= verifyTree checkQuotesInLiterals "param=\"--foo='lolbar'\"; app $param"
@@ -1674,7 +2001,7 @@ prop_checkQuotesInLiterals9 = verifyNotTree checkQuotesInLiterals "param=\"/foo/
 checkQuotesInLiterals params t =
     doVariableFlowAnalysis readF writeF Map.empty (variableFlow params)
   where
-    getQuotes name = liftM (Map.lookup name) get
+    getQuotes name = gets (Map.lookup name)
     setQuotes name ref = modify $ Map.insert name ref
     deleteQuotes = modify . Map.delete
     parents = parentMap params
@@ -1690,7 +2017,7 @@ checkQuotesInLiterals params t =
         return []
     writeF _ _ _ _ = return []
 
-    forToken map (T_DollarBraced id t) =
+    forToken map (T_DollarBraced id _ t) =
         -- skip getBracedReference here to avoid false positives on PE
         Map.lookup (concat . oversimplify $ t) map
     forToken quoteMap (T_DoubleQuoted id tokens) =
@@ -1704,51 +2031,86 @@ checkQuotesInLiterals params t =
 
     squashesQuotes t =
         case t of
-            T_DollarBraced id _ -> "#" `isPrefixOf` bracedString t
-            otherwise -> False
+            T_DollarBraced id _ l -> "#" `isPrefixOf` concat (oversimplify l)
+            _ -> False
 
     readF _ expr name = do
         assignment <- getQuotes name
-        return
-          (if isJust assignment
-              && not (isParamTo parents "eval" expr)
+        return $ case assignment of
+          Just j
+              | not (isParamTo parents "eval" expr)
               && not (isQuoteFree parents expr)
               && not (squashesQuotes expr)
-              then [
-                  makeComment WarningC (fromJust assignment) 2089
-                      "Quotes/backslashes will be treated literally. Use an array.",
+              -> [
+                  makeComment WarningC j 2089 $
+                      "Quotes/backslashes will be treated literally. " ++ suggestion,
                   makeComment WarningC (getId expr) 2090
                       "Quotes/backslashes in this variable will not be respected."
                 ]
-              else [])
+          _ -> []
+    suggestion =
+        if supportsArrays (shellType params)
+        then "Use an array."
+        else "Rewrite using set/\"$@\" or functions."
 
 
 prop_checkFunctionsUsedExternally1 =
   verifyTree checkFunctionsUsedExternally "foo() { :; }; sudo foo"
 prop_checkFunctionsUsedExternally2 =
-  verifyTree checkFunctionsUsedExternally "alias f='a'; xargs -n 1 f"
+  verifyTree checkFunctionsUsedExternally "alias f='a'; xargs -0 f"
+prop_checkFunctionsUsedExternally2b=
+  verifyNotTree checkFunctionsUsedExternally "alias f='a'; find . -type f"
+prop_checkFunctionsUsedExternally2c=
+  verifyTree checkFunctionsUsedExternally "alias f='a'; find . -type f -exec f +"
 prop_checkFunctionsUsedExternally3 =
   verifyNotTree checkFunctionsUsedExternally "f() { :; }; echo f"
 prop_checkFunctionsUsedExternally4 =
   verifyNotTree checkFunctionsUsedExternally "foo() { :; }; sudo \"foo\""
+prop_checkFunctionsUsedExternally5 =
+  verifyTree checkFunctionsUsedExternally "foo() { :; }; ssh host foo"
+prop_checkFunctionsUsedExternally6 =
+  verifyNotTree checkFunctionsUsedExternally "foo() { :; }; ssh host echo foo"
+prop_checkFunctionsUsedExternally7 =
+  verifyNotTree checkFunctionsUsedExternally "install() { :; }; sudo apt-get install foo"
+prop_checkFunctionsUsedExternally8 =
+  verifyTree checkFunctionsUsedExternally "foo() { :; }; command sudo foo"
+prop_checkFunctionsUsedExternally9 =
+  verifyTree checkFunctionsUsedExternally "foo() { :; }; exec -c sudo foo"
 checkFunctionsUsedExternally params t =
     runNodeAnalysis checkCommand params t
   where
-    invokingCmds = [
-        "chroot",
-        "find",
-        "screen",
-        "ssh",
-        "su",
-        "sudo",
-        "xargs"
-        ]
-    checkCommand _ t@(T_SimpleCommand _ _ (cmd:args)) =
-        let name = fromMaybe "" $ getCommandBasename t in
-          when (name `elem` invokingCmds) $
-            mapM_ (checkArg name) args
+    checkCommand _ t@(T_SimpleCommand _ _ argv) =
+        case getCommandNameAndToken False t of
+            (Just str, t) -> do
+                let name = basename str
+                let args = skipOver t argv
+                let argStrings = map (\x -> (fromMaybe "" $ getLiteralString x, x)) args
+                let candidates = getPotentialCommands name argStrings
+                mapM_ (checkArg name) candidates
+            _ -> return ()
     checkCommand _ _ = return ()
 
+    skipOver t list = drop 1 $ dropWhile (\c -> getId c /= id) $ list
+      where id = getId t
+
+    -- Try to pick out the argument[s] that may be commands
+    getPotentialCommands name argAndString =
+        case name of
+            "chroot" -> firstNonFlag
+            "screen" -> firstNonFlag
+            "sudo" -> firstNonFlag
+            "xargs" -> firstNonFlag
+            "tmux" -> firstNonFlag
+            "ssh" -> take 1 $ drop 1 $ dropFlags argAndString
+            "find" -> take 1 $ drop 1 $
+                dropWhile (\x -> fst x `notElem` findExecFlags) argAndString
+            _ -> []
+      where
+        firstNonFlag = take 1 $ dropFlags argAndString
+        findExecFlags = ["-exec", "-execdir", "-ok"]
+        dropFlags = dropWhile (\x -> "-" `isPrefixOf` fst x)
+
+    -- Make a map from functions/aliases to definition IDs
     analyse f t = execState (doAnalysis f t) []
     functions = Map.fromList $ analyse findFunctions t
     findFunctions (T_Function id _ _ name _) = modify ((name, id):)
@@ -1756,10 +2118,11 @@ checkFunctionsUsedExternally params t =
         | t `isUnqualifiedCommand` "alias" = mapM_ getAlias args
     findFunctions _ = return ()
     getAlias arg =
-        let string = concat $ oversimplify arg
+        let string = onlyLiteralString arg
         in when ('=' `elem` string) $
             modify ((takeWhile (/= '=') string, getId arg):)
-    checkArg cmd arg = potentially $ do
+
+    checkArg cmd (_, arg) = sequence_ $ do
         literalArg <- getUnquotedLiteral arg  -- only consider unquoted literals
         definitionId <- Map.lookup literalArg functions
         return $ do
@@ -1785,6 +2148,7 @@ prop_checkUnused13= verifyNotTree checkUnusedAssignments "x=(1); (( x[0] ))"
 prop_checkUnused14= verifyNotTree checkUnusedAssignments "x=(1); n=0; echo ${x[n]}"
 prop_checkUnused15= verifyNotTree checkUnusedAssignments "x=(1); n=0; (( x[n] ))"
 prop_checkUnused16= verifyNotTree checkUnusedAssignments "foo=5; declare -x foo"
+prop_checkUnused16b= verifyNotTree checkUnusedAssignments "f() { local -x foo; foo=42; bar; }; f"
 prop_checkUnused17= verifyNotTree checkUnusedAssignments "read -i 'foo' -e -p 'Input: ' bar; $bar;"
 prop_checkUnused18= verifyNotTree checkUnusedAssignments "a=1; arr=( [$a]=42 ); echo \"${arr[@]}\""
 prop_checkUnused19= verifyNotTree checkUnusedAssignments "a=1; let b=a+1; echo $b"
@@ -1804,6 +2168,18 @@ prop_checkUnused32= verifyTree checkUnusedAssignments "let a=b=c; echo $a"
 prop_checkUnused33= verifyNotTree checkUnusedAssignments "a=foo; [[ foo =~ ^{$a}$ ]]"
 prop_checkUnused34= verifyNotTree checkUnusedAssignments "foo=1; (( t = foo )); echo $t"
 prop_checkUnused35= verifyNotTree checkUnusedAssignments "a=foo; b=2; echo ${a:b}"
+prop_checkUnused36= verifyNotTree checkUnusedAssignments "if [[ -v foo ]]; then true; fi"
+prop_checkUnused37= verifyNotTree checkUnusedAssignments "fd=2; exec {fd}>&-"
+prop_checkUnused38= verifyTree checkUnusedAssignments "(( a=42 ))"
+prop_checkUnused39= verifyNotTree checkUnusedAssignments "declare -x -f foo"
+prop_checkUnused40= verifyNotTree checkUnusedAssignments "arr=(1 2); num=2; echo \"${arr[@]:num}\""
+prop_checkUnused41= verifyNotTree checkUnusedAssignments "@test 'foo' {\ntrue\n}\n"
+prop_checkUnused42= verifyNotTree checkUnusedAssignments "DEFINE_string foo '' ''; echo \"${FLAGS_foo}\""
+prop_checkUnused43= verifyTree checkUnusedAssignments "DEFINE_string foo '' ''"
+prop_checkUnused44= verifyNotTree checkUnusedAssignments "DEFINE_string \"foo$ibar\" x y"
+prop_checkUnused45= verifyTree checkUnusedAssignments "readonly foo=bar"
+prop_checkUnused46= verifyTree checkUnusedAssignments "readonly foo=(bar)"
+prop_checkUnused47= verifyNotTree checkUnusedAssignments "a=1; alias hello='echo $a'"
 checkUnusedAssignments params t = execWriter (mapM_ warnFor unused)
   where
     flow = variableFlow params
@@ -1821,7 +2197,7 @@ checkUnusedAssignments params t = execWriter (mapM_ warnFor unused)
 
     warnFor (name, token) =
         warn (getId token) 2034 $
-            name ++ " appears unused. Verify it or export it."
+            name ++ " appears unused. Verify use (or export if used externally)."
 
     stripSuffix = takeWhile isVariableChar
     defaultMap = Map.fromList $ zip internalVariables $ repeat ()
@@ -1854,7 +2230,30 @@ prop_checkUnassignedReferences25= verifyNotTree checkUnassignedReferences "decla
 prop_checkUnassignedReferences26= verifyNotTree checkUnassignedReferences "a::b() { foo; }; readonly -f a::b"
 prop_checkUnassignedReferences27= verifyNotTree checkUnassignedReferences ": ${foo:=bar}"
 prop_checkUnassignedReferences28= verifyNotTree checkUnassignedReferences "#!/bin/ksh\necho \"${.sh.version}\"\n"
-checkUnassignedReferences params t = warnings
+prop_checkUnassignedReferences29= verifyNotTree checkUnassignedReferences "if [[ -v foo ]]; then echo $foo; fi"
+prop_checkUnassignedReferences30= verifyNotTree checkUnassignedReferences "if [[ -v foo[3] ]]; then echo ${foo[3]}; fi"
+prop_checkUnassignedReferences31= verifyNotTree checkUnassignedReferences "X=1; if [[ -v foo[$X+42] ]]; then echo ${foo[$X+42]}; fi"
+prop_checkUnassignedReferences32= verifyNotTree checkUnassignedReferences "if [[ -v \"foo[1]\" ]]; then echo ${foo[@]}; fi"
+prop_checkUnassignedReferences33= verifyNotTree checkUnassignedReferences "f() { local -A foo; echo \"${foo[@]}\"; }"
+prop_checkUnassignedReferences34= verifyNotTree checkUnassignedReferences "declare -A foo; (( foo[bar] ))"
+prop_checkUnassignedReferences35= verifyNotTree checkUnassignedReferences "echo ${arr[foo-bar]:?fail}"
+prop_checkUnassignedReferences36= verifyNotTree checkUnassignedReferences "read -a foo -r <<<\"foo bar\"; echo \"$foo\""
+prop_checkUnassignedReferences37= verifyNotTree checkUnassignedReferences "var=howdy; printf -v 'array[0]' %s \"$var\"; printf %s \"${array[0]}\";"
+prop_checkUnassignedReferences38= verifyTree (checkUnassignedReferences' True) "echo $VAR"
+prop_checkUnassignedReferences39= verifyNotTree checkUnassignedReferences "builtin export var=4; echo $var"
+prop_checkUnassignedReferences40= verifyNotTree checkUnassignedReferences ": ${foo=bar}"
+prop_checkUnassignedReferences41= verifyNotTree checkUnassignedReferences "mapfile -t files 123; echo \"${files[@]}\""
+prop_checkUnassignedReferences42= verifyNotTree checkUnassignedReferences "mapfile files -t; echo \"${files[@]}\""
+prop_checkUnassignedReferences43= verifyNotTree checkUnassignedReferences "mapfile --future files; echo \"${files[@]}\""
+prop_checkUnassignedReferences_minusNPlain   = verifyNotTree checkUnassignedReferences "if [ -n \"$x\" ]; then echo $x; fi"
+prop_checkUnassignedReferences_minusZPlain   = verifyNotTree checkUnassignedReferences "if [ -z \"$x\" ]; then echo \"\"; fi"
+prop_checkUnassignedReferences_minusNBraced  = verifyNotTree checkUnassignedReferences "if [ -n \"${x}\" ]; then echo $x; fi"
+prop_checkUnassignedReferences_minusZBraced  = verifyNotTree checkUnassignedReferences "if [ -z \"${x}\" ]; then echo \"\"; fi"
+prop_checkUnassignedReferences_minusNDefault = verifyNotTree checkUnassignedReferences "if [ -n \"${x:-}\" ]; then echo $x; fi"
+prop_checkUnassignedReferences_minusZDefault = verifyNotTree checkUnassignedReferences "if [ -z \"${x:-}\" ]; then echo \"\"; fi"
+
+checkUnassignedReferences = checkUnassignedReferences' False
+checkUnassignedReferences' includeGlobals params t = warnings
   where
     (readMap, writeMap) = execState (mapM tally $ variableFlow params) (Map.empty, Map.empty)
     defaultAssigned = Map.fromList $ map (\a -> (a, ())) $ filter (not . null) internalVariables
@@ -1862,7 +2261,7 @@ checkUnassignedReferences params t = warnings
     tally (Assignment (_, _, name, _))  =
         modify (\(read, written) -> (read, Map.insert name () written))
     tally (Reference (_, place, name)) =
-        modify (\(read, written) -> (Map.insertWith' (const id) name place read, written))
+        modify (\(read, written) -> (Map.insertWith (const id) name place read, written))
     tally _ = return ()
 
     unassigned = Map.toList $ Map.difference (Map.difference readMap writeMap) defaultAssigned
@@ -1898,26 +2297,31 @@ checkUnassignedReferences params t = warnings
                     match <- getBestMatch var
                     return $ " (did you mean '" ++ match ++ "'?)"
 
-    warningFor var place = do
+    warningFor (var, place) = do
+        guard $ isVariableName var
         guard . not $ isInArray var place || isGuarded place
-        (if isLocal var then warningForLocals else warningForGlobals) var place
+        (if includeGlobals || isLocal var
+         then warningForLocals
+         else warningForGlobals) var place
 
-    warnings = execWriter . sequence $ mapMaybe (uncurry warningFor) unassigned
+    warnings = execWriter . sequence $ mapMaybe warningFor unassigned
 
     -- Due to parsing, foo=( [bar]=baz ) parses 'bar' as a reference even for assoc arrays.
     -- Similarly, ${foo[bar baz]} may not be referencing bar/baz. Just skip these.
     isInArray var t = any isArray $ getPath (parentMap params) t
       where
-        isArray (T_Array {}) = True
-        isArray b@(T_DollarBraced _ _) | var /= getBracedReference (bracedString b) = True
+        isArray T_Array {} = True
+        isArray (T_DollarBraced _ _ l) | var /= getBracedReference (concat $ oversimplify l) = True
         isArray _ = False
 
-    isGuarded (T_DollarBraced _ v) =
-        any (`isPrefixOf` rest) ["-", ":-", "?", ":?"]
+    isGuarded (T_DollarBraced _ _ v) =
+        rest `matches` guardRegex
       where
         name = concat $ oversimplify v
         rest = dropWhile isVariableChar $ dropWhile (`elem` "#!") name
     isGuarded _ = False
+    --  :? or :- with optional array index and colon
+    guardRegex = mkRegex "^(\\[.*\\])?:?[-?]"
 
     match var candidate =
         if var /= candidate && map toLower var == map toLower candidate
@@ -1928,8 +2332,12 @@ checkUnassignedReferences params t = warnings
 prop_checkGlobsAsOptions1 = verify checkGlobsAsOptions "rm *.txt"
 prop_checkGlobsAsOptions2 = verify checkGlobsAsOptions "ls ??.*"
 prop_checkGlobsAsOptions3 = verifyNot checkGlobsAsOptions "rm -- *.txt"
-checkGlobsAsOptions _ (T_SimpleCommand _ _ args) =
-    mapM_ check $ takeWhile (not . isEndOfArgs) args
+prop_checkGlobsAsOptions4 = verifyNot checkGlobsAsOptions "*.txt"
+prop_checkGlobsAsOptions5 = verifyNot checkGlobsAsOptions "echo 'Files:' *.txt"
+prop_checkGlobsAsOptions6 = verifyNot checkGlobsAsOptions "printf '%s\\n' *"
+checkGlobsAsOptions _ cmd@(T_SimpleCommand _ _ args) =
+    unless ((fromMaybe "" $ getCommandBasename cmd) `elem` ["echo", "printf"]) $
+        mapM_ check $ takeWhile (not . isEndOfArgs) (drop 1 args)
   where
     check v@(T_NormalWord _ (T_Glob id s:_)) | s == "*" || s == "?" =
         info id 2035 "Use ./*glob* or -- *glob* so names with dashes won't become options."
@@ -1953,52 +2361,90 @@ prop_checkWhileReadPitfalls5 = verifyNot checkWhileReadPitfalls "while read foo;
 prop_checkWhileReadPitfalls6 = verifyNot checkWhileReadPitfalls "while read foo <&3; do ssh $foo; done 3< foo"
 prop_checkWhileReadPitfalls7 = verify checkWhileReadPitfalls "while read foo; do if true; then ssh $foo uptime; fi; done < file"
 prop_checkWhileReadPitfalls8 = verifyNot checkWhileReadPitfalls "while read foo; do ssh -n $foo uptime; done < file"
+prop_checkWhileReadPitfalls9 = verify checkWhileReadPitfalls "while read foo; do ffmpeg -i foo.mkv bar.mkv -an; done"
+prop_checkWhileReadPitfalls10 = verify checkWhileReadPitfalls "while read foo; do mplayer foo.ogv > file; done"
+prop_checkWhileReadPitfalls11 = verifyNot checkWhileReadPitfalls "while read foo; do mplayer foo.ogv <<< q; done"
+prop_checkWhileReadPitfalls12 = verifyNot checkWhileReadPitfalls "while read foo\ndo\nmplayer foo.ogv << EOF\nq\nEOF\ndone"
+prop_checkWhileReadPitfalls13 = verify checkWhileReadPitfalls "while read foo; do x=$(ssh host cmd); done"
+prop_checkWhileReadPitfalls14 = verify checkWhileReadPitfalls "while read foo; do echo $(ssh host cmd) < /dev/null; done"
+prop_checkWhileReadPitfalls15 = verify checkWhileReadPitfalls "while read foo; do ssh $foo cmd & done"
 
-checkWhileReadPitfalls _ (T_WhileExpression id [command] contents)
+checkWhileReadPitfalls params (T_WhileExpression id [command] contents)
         | isStdinReadCommand command =
     mapM_ checkMuncher contents
   where
-    munchers = [ "ssh", "ffmpeg", "mplayer" ]
-    preventionFlags = ["n", "noconsolecontrols" ]
+    -- Map of munching commands to a function that checks if the flags should exclude it
+    munchers = Map.fromList [
+        ("ssh", (hasFlag, addFlag, "-n")),
+        ("ffmpeg", (hasArgument, addFlag, "-nostdin")),
+        ("mplayer", (hasArgument, addFlag, "-noconsolecontrols")),
+        ("HandBrakeCLI", (\_ _ -> False, addRedirect, "< /dev/null"))
+        ]
+    -- Use flag parsing, e.g. "-an" -> "a", "n"
+    hasFlag ('-':flag) = elem flag . map snd . getAllFlags
+    -- Simple string match, e.g. "-an" -> "-an"
+    hasArgument arg = elem arg . mapMaybe getLiteralString . fromJust . getCommandArgv
+    addFlag string cmd = fixWith [replaceEnd (getId $ getCommandTokenOrThis cmd) params 0 (' ':string)]
+    addRedirect string cmd = fixWith [replaceEnd (getId cmd) params 0 (' ':string)]
 
     isStdinReadCommand (T_Pipeline _ _ [T_Redirecting id redirs cmd]) =
         let plaintext = oversimplify cmd
-        in head (plaintext ++ [""]) == "read"
+        in headOrDefault "" plaintext == "read"
             && ("-u" `notElem` plaintext)
-            && all (not . stdinRedirect) redirs
+            && not (any stdinRedirect redirs)
     isStdinReadCommand _ = False
 
-    checkMuncher (T_Pipeline _ _ (T_Redirecting _ redirs cmd:_)) | not $ any stdinRedirect redirs =
+    checkMuncher :: Token -> Writer [TokenComment] ()
+    checkMuncher (T_Pipeline _ _ (T_Redirecting _ redirs cmd:_)) = do
+        -- Check command substitutions regardless of the command
         case cmd of
-            (T_IfExpression _ thens elses) ->
-              mapM_ checkMuncher . concat $ map fst thens ++ map snd thens ++ [elses]
+            T_SimpleCommand _ vars args ->
+                mapM_ checkMuncher $ concat $ concatMap getCommandSequences $ concatMap getWords $ vars ++ args
+            _ -> return ()
 
-            _ -> potentially $ do
+        unless (any stdinRedirect redirs) $ do
+            -- Recurse into ifs/loops/groups/etc if this doesn't redirect
+            mapM_ checkMuncher $ concat $ getCommandSequences cmd
+
+            -- Check the actual command
+            sequence_ $ do
                 name <- getCommandBasename cmd
-                guard $ name `elem` munchers
+                (check, fix, flag) <- Map.lookup name munchers
+                guard $ not (check flag cmd)
 
-                -- Sloppily check if the command has a flag to prevent eating stdin.
-                let flags = getAllFlags cmd
-                guard . not $ any (`elem` preventionFlags) $ map snd flags
                 return $ do
                     info id 2095 $
                         name ++ " may swallow stdin, preventing this loop from working properly."
-                    warn (getId cmd) 2095 $
-                        "Add < /dev/null to prevent " ++ name ++ " from swallowing stdin."
+                    warnWithFix (getId cmd) 2095
+                        ("Use " ++ name ++ " " ++ flag ++ " to prevent " ++ name ++ " from swallowing stdin.")
+                        (fix flag cmd)
+    checkMuncher (T_Backgrounded _ t) = checkMuncher t
     checkMuncher _ = return ()
 
-    stdinRedirect (T_FdRedirect _ fd _)
-        | fd == "" || fd == "0" = True
+    stdinRedirect (T_FdRedirect _ fd op)
+        | fd == "0" = True
+        | fd == "" =
+            case op of
+                T_IoFile _ (T_Less _) _ -> True
+                T_IoDuplicate _ (T_LESSAND _) _ -> True
+                T_HereString _ _ -> True
+                T_HereDoc {} -> True
+                _ -> False
     stdinRedirect _ = False
+
+    getWords t =
+        case t of
+            T_Assignment _ _ _ _ x -> getWordParts x
+            _ -> getWordParts t
 checkWhileReadPitfalls _ _ = return ()
 
 
 prop_checkPrefixAssign1 = verify checkPrefixAssignmentReference "var=foo echo $var"
 prop_checkPrefixAssign2 = verifyNot checkPrefixAssignmentReference "var=$(echo $var) cmd"
-checkPrefixAssignmentReference params t@(T_DollarBraced id value) =
+checkPrefixAssignmentReference params t@(T_DollarBraced id _ value) =
     check path
   where
-    name = getBracedReference $ bracedString t
+    name = getBracedReference $ concat $ oversimplify value
     path = getPath (parentMap params) t
     idPath = map getId path
 
@@ -2006,7 +2452,7 @@ checkPrefixAssignmentReference params t@(T_DollarBraced id value) =
     check (t:rest) =
         case t of
             T_SimpleCommand _ vars (_:_) -> mapM_ checkVar vars
-            otherwise -> check rest
+            _ -> check rest
     checkVar (T_Assignment aId mode aName [] value) |
             aName == name && (aId `notElem` idPath) = do
         warn aId 2097 "This assignment is only seen by the forked process."
@@ -2020,6 +2466,7 @@ prop_checkCharRangeGlob2 = verifyNot checkCharRangeGlob "ls *[[:digit:]].jpg"
 prop_checkCharRangeGlob3 = verify checkCharRangeGlob "ls [10-15]"
 prop_checkCharRangeGlob4 = verifyNot checkCharRangeGlob "ls [a-zA-Z]"
 prop_checkCharRangeGlob5 = verifyNot checkCharRangeGlob "tr -d [a-zA-Z]" -- tr has 2060
+prop_checkCharRangeGlob6 = verifyNot checkCharRangeGlob "[[ $x == [!!]* ]]"
 checkCharRangeGlob p t@(T_Glob id str) |
   isCharClass str && not (isParamTo (parentMap p) "tr" t) =
     if ":" `isPrefixOf` contents
@@ -2031,8 +2478,13 @@ checkCharRangeGlob p t@(T_Glob id str) |
             info id 2102 "Ranges can only match single chars (mentioned due to duplicates)."
   where
     isCharClass str = "[" `isPrefixOf` str && "]" `isSuffixOf` str
-    contents = drop 1 . take (length str - 1) $ str
+    contents = dropNegation . drop 1 . take (length str - 1) $ str
     hasDupes = any (>1) . map length . group . sort . filter (/= '-') $ contents
+    dropNegation s =
+        case s of
+            '!':rest -> rest
+            '^':rest -> rest
+            x -> x
 checkCharRangeGlob _ _ = return ()
 
 
@@ -2041,34 +2493,33 @@ prop_checkCdAndBack1 = verify checkCdAndBack "for f in *; do cd $f; git pull; cd
 prop_checkCdAndBack2 = verifyNot checkCdAndBack "for f in *; do cd $f || continue; git pull; cd ..; done"
 prop_checkCdAndBack3 = verifyNot checkCdAndBack "while [[ $PWD != / ]]; do cd ..; done"
 prop_checkCdAndBack4 = verify checkCdAndBack "cd $tmp; foo; cd -"
-checkCdAndBack params = doLists
+prop_checkCdAndBack5 = verifyNot checkCdAndBack "cd ..; foo; cd .."
+prop_checkCdAndBack6 = verify checkCdAndBack "for dir in */; do cd \"$dir\"; some_cmd; cd ..; done"
+prop_checkCdAndBack7 = verifyNot checkCdAndBack "set -e; for dir in */; do cd \"$dir\"; some_cmd; cd ..; done"
+prop_checkCdAndBack8 = verifyNot checkCdAndBack "cd tmp\nfoo\n# shellcheck disable=SC2103\ncd ..\n"
+checkCdAndBack params t =
+    unless (hasSetE params) $ mapM_ doList $ getCommandSequences t
   where
-    shell = shellType params
-    doLists (T_ForIn _ _ _ cmds) = doList cmds
-    doLists (T_ForArithmetic _ _ _ _ cmds) = doList cmds
-    doLists (T_WhileExpression _ _ cmds) = doList cmds
-    doLists (T_UntilExpression _ _ cmds) = doList cmds
-    doLists (T_Script _ _ cmds) = doList cmds
-    doLists (T_IfExpression _ thens elses) = do
-        mapM_ (\(_, l) -> doList l) thens
-        doList elses
-    doLists _ = return ()
-
     isCdRevert t =
         case oversimplify t of
-            ["cd", p] -> p `elem` ["..", "-"]
+            [_, p] -> p `elem` ["..", "-"]
             _ -> False
 
-    getCmd (T_Annotation id _ x) = getCmd x
-    getCmd (T_Pipeline id _ [x]) = getCommandName x
-    getCmd _ = Nothing
+    getCandidate (T_Annotation _ _ x) = getCandidate x
+    getCandidate (T_Pipeline id _ [x]) | x `isCommand` "cd" = return x
+    getCandidate _ = Nothing
 
-    doList list =
-        let cds = filter ((== Just "cd") . getCmd) list in
-            when (length cds >= 2 && isCdRevert (last cds)) $
-               info (getId $ last cds) 2103 message
+    findCdPair list =
+        case list of
+            (a:b:rest) ->
+                if isCdRevert b && not (isCdRevert a)
+                then return $ getId b
+                else findCdPair (b:rest)
+            _ -> Nothing
 
-    message = "Use a ( subshell ) to avoid having to cd back."
+    doList list = sequence_ $ do
+        cd <- findCdPair $ mapMaybe getCandidate list
+        return $ info cd 2103 "Use a ( subshell ) to avoid having to cd back."
 
 prop_checkLoopKeywordScope1 = verify checkLoopKeywordScope "continue 2"
 prop_checkLoopKeywordScope2 = verify checkLoopKeywordScope "for f; do ( break; ); done"
@@ -2091,7 +2542,7 @@ checkLoopKeywordScope params t |
   where
     name = getCommandName t
     path = let p = getPath (parentMap params) t in filter relevant p
-    subshellType t = case leadType (shellType params) (parentMap params) t of
+    subshellType t = case leadType params t of
         NoneScope -> Nothing
         SubshellScope str -> return str
     relevant t = isLoop t || isFunction t || isJust (subshellType t)
@@ -2120,72 +2571,6 @@ checkFunctionDeclarations params
 checkFunctionDeclarations _ _ = return ()
 
 
-prop_checkCatastrophicRm1 = verify checkCatastrophicRm "rm -r $1/$2"
-prop_checkCatastrophicRm2 = verify checkCatastrophicRm "rm -r /home/$foo"
-prop_checkCatastrophicRm3 = verifyNot checkCatastrophicRm "rm -r /home/${USER:?}/*"
-prop_checkCatastrophicRm4 = verify checkCatastrophicRm "rm -fr /home/$(whoami)/*"
-prop_checkCatastrophicRm5 = verifyNot checkCatastrophicRm "rm -r /home/${USER:-thing}/*"
-prop_checkCatastrophicRm6 = verify checkCatastrophicRm "rm --recursive /etc/*$config*"
-prop_checkCatastrophicRm8 = verify checkCatastrophicRm "rm -rf /home"
-prop_checkCatastrophicRm9 = verifyNot checkCatastrophicRm "rm -rf -- /home"
-prop_checkCatastrophicRm10= verifyNot checkCatastrophicRm "rm -r \"${DIR}\"/{.gitignore,.gitattributes,ci}"
-prop_checkCatastrophicRm11= verify checkCatastrophicRm "rm -r /{bin,sbin}/$exec"
-prop_checkCatastrophicRm12= verify checkCatastrophicRm "rm -r /{{usr,},{bin,sbin}}/$exec"
-prop_checkCatastrophicRm13= verifyNot checkCatastrophicRm "rm -r /{{a,b},{c,d}}/$exec"
-prop_checkCatastrophicRmA = verify checkCatastrophicRm "rm -rf /usr /lib/nvidia-current/xorg/xorg"
-prop_checkCatastrophicRmB = verify checkCatastrophicRm "rm -rf \"$STEAMROOT/\"*"
-checkCatastrophicRm params t@(T_SimpleCommand id _ tokens) | t `isCommand` "rm" =
-    when (any isRecursiveFlag simpleArgs) $
-        mapM_ (mapM_ checkWord . braceExpand) tokens
-  where
-    simpleArgs = oversimplify t
-
-    checkWord token =
-        case getLiteralString token of
-            Just str ->
-                when (notElem "--" simpleArgs && (fixPath str `elem` importantPaths)) $
-                    warn (getId token) 2114 "Warning: deletes a system directory. Use 'rm --' to disable this message."
-            Nothing ->
-                checkWord' token
-
-    checkWord' token = fromMaybe (return ()) $ do
-        filename <- getPotentialPath token
-        let path = fixPath filename
-        return . when (path `elem` importantPaths) $
-            warn (getId token) 2115 $ "Use \"${var:?}\" to ensure this never expands to " ++ path ++ " ."
-
-    fixPath filename =
-        let normalized = skipRepeating '/' . skipRepeating '*' $ filename in
-            if normalized == "/" then normalized else stripTrailing '/' normalized
-
-    getPotentialPath = getLiteralStringExt f
-      where
-        f (T_Glob _ str) = return str
-        f (T_DollarBraced _ word) =
-            let var = onlyLiteralString word in
-                if any (flip isInfixOf var) [":?", ":-", ":="]
-                then Nothing
-                else return ""
-        f _ = return ""
-
-    isRecursiveFlag "--recursive" = True
-    isRecursiveFlag ('-':'-':_) = False
-    isRecursiveFlag ('-':str) = 'r' `elem` str || 'R' `elem` str
-    isRecursiveFlag _ = False
-
-    stripTrailing c = reverse . dropWhile (== c) . reverse
-    skipRepeating c (a:b:rest) | a == b && b == c = skipRepeating c (b:rest)
-    skipRepeating c (a:r) = a:skipRepeating c r
-    skipRepeating _ [] = []
-
-    paths = [
-        "", "/bin", "/etc", "/home", "/mnt", "/usr", "/usr/share", "/usr/local",
-        "/var", "/lib"
-        ]
-    importantPaths = filter (not . null) $
-        ["", "/", "/*", "/*/*"] >>= (\x -> map (++x) paths)
-checkCatastrophicRm _ _ = return ()
-
 
 prop_checkStderrPipe1 = verify checkStderrPipe "#!/bin/ksh\nfoo |& bar"
 prop_checkStderrPipe2 = verifyNot checkStderrPipe "#!/bin/bash\nfoo |& bar"
@@ -2209,6 +2594,9 @@ prop_checkUnpassedInFunctions8 = verifyNotTree checkUnpassedInFunctions "foo() {
 prop_checkUnpassedInFunctions9 = verifyNotTree checkUnpassedInFunctions "foo() { echo $(($b)); }; foo;"
 prop_checkUnpassedInFunctions10= verifyNotTree checkUnpassedInFunctions "foo() { echo $!; }; foo;"
 prop_checkUnpassedInFunctions11= verifyNotTree checkUnpassedInFunctions "foo() { bar() { echo $1; }; bar baz; }; foo;"
+prop_checkUnpassedInFunctions12= verifyNotTree checkUnpassedInFunctions "foo() { echo ${!var*}; }; foo;"
+prop_checkUnpassedInFunctions13= verifyNotTree checkUnpassedInFunctions "# shellcheck disable=SC2120\nfoo() { echo $1; }\nfoo\n"
+prop_checkUnpassedInFunctions14= verifyTree checkUnpassedInFunctions "foo() { echo $#; }; foo"
 checkUnpassedInFunctions params root =
     execWriter $ mapM_ warnForGroup referenceGroups
   where
@@ -2217,12 +2605,10 @@ checkUnpassedInFunctions params root =
         map (\t@(T_Function _ _ _ name _) -> (name,t)) functions
     functions = execWriter $ doAnalysis (tell . maybeToList . findFunction) root
 
-    findFunction t@(T_Function id _ _ name body) =
-        let flow = getVariableFlow (shellType params) (parentMap params) body
-        in
-          if any (isPositionalReference t) flow && not (any isPositionalAssignment flow)
-            then return t
-            else Nothing
+    findFunction t@(T_Function id _ _ name body)
+        | any (isPositionalReference t) flow && not (any isPositionalAssignment flow)
+        = return t
+        where flow = getVariableFlow params body
     findFunction _ = Nothing
 
     isPositionalAssignment x =
@@ -2235,37 +2621,47 @@ checkUnpassedInFunctions params root =
             _ -> False
 
     isDirectChildOf child parent = fromMaybe False $ do
-        function <- find (\x -> case x of T_Function {} -> True; _ -> False) $ getPath (parentMap params) child
+        function <- find (\x -> case x of
+            T_Function {} -> True
+            T_Script {} -> True  -- for sourced files
+            _ -> False) $
+                getPath (parentMap params) child
         return $ getId parent == getId function
 
     referenceList :: [(String, Bool, Token)]
     referenceList = execWriter $
-        doAnalysis (fromMaybe (return ()) . checkCommand) root
+        doAnalysis (sequence_ . checkCommand) root
     checkCommand :: Token -> Maybe (Writer [(String, Bool, Token)] ())
     checkCommand t@(T_SimpleCommand _ _ (cmd:args)) = do
         str <- getLiteralString cmd
-        unless (Map.member str functionMap) $ fail "irrelevant"
+        guard $ Map.member str functionMap
         return $ tell [(str, null args, t)]
     checkCommand _ = Nothing
 
-    isPositional str = str == "*" || str == "@"
-        || (all isDigit str && str /= "0")
+    isPositional str = str == "*" || str == "@" || str == "#"
+        || (all isDigit str && str /= "0" && str /= "")
 
     isArgumentless (_, b, _) = b
     referenceGroups = Map.elems $ foldr updateWith Map.empty referenceList
     updateWith x@(name, _, _) = Map.insertWith (++) name [x]
 
     warnForGroup group =
-        when (all isArgumentless group) $ do
+        -- Allow ignoring SC2120 on the function to ignore all calls
+        when (all isArgumentless group && not ignoring) $ do
             mapM_ suggestParams group
-            warnForDeclaration group
+            warnForDeclaration func name
+        where (name, func) = getFunction group
+              ignoring = shouldIgnoreCode params 2120 func
 
     suggestParams (name, _, thing) =
         info (getId thing) 2119 $
             "Use " ++ name ++ " \"$@\" if function's $1 should mean script's $1."
-    warnForDeclaration ((name, _, _):_) =
-        warn (getId . fromJust $ Map.lookup name functionMap) 2120 $
+    warnForDeclaration func name =
+        warn (getId func) 2120 $
             name ++ " references arguments, but none are ever passed."
+
+    getFunction ((name, _, _):_) =
+        (name, functionMap Map.! name)
 
 
 prop_checkOverridingPath1 = verify checkOverridingPath "PATH=\"$var/$foo\""
@@ -2279,11 +2675,11 @@ prop_checkOverridingPath8 = verifyNot checkOverridingPath "PATH=$PATH:/stuff"
 checkOverridingPath _ (T_SimpleCommand _ vars []) =
     mapM_ checkVar vars
   where
-    checkVar (T_Assignment id Assign "PATH" [] word) =
-        let string = concat $ oversimplify word
-        in unless (any (`isInfixOf` string) ["/bin", "/sbin" ]) $ do
+    checkVar (T_Assignment id Assign "PATH" [] word)
+        | not $ any (`isInfixOf` string) ["/bin", "/sbin" ] = do
             when ('/' `elem` string && ':' `notElem` string) $ notify id
             when (isLiteral word && ':' `notElem` string && '/' `notElem` string) $ notify id
+        where string = concat $ oversimplify word
     checkVar _ = return ()
     notify id = warn id 2123 "PATH is the shell search path. Use another name."
 checkOverridingPath _ _ = return ()
@@ -2294,14 +2690,14 @@ prop_checkTildeInPath3 = verifyNot checkTildeInPath "PATH=~/bin"
 checkTildeInPath _ (T_SimpleCommand _ vars _) =
     mapM_ checkVar vars
   where
-    checkVar (T_Assignment id Assign "PATH" [] (T_NormalWord _ parts)) =
-        when (any (\x -> isQuoted x && hasTilde x) parts) $
+    checkVar (T_Assignment id Assign "PATH" [] (T_NormalWord _ parts))
+        | any (\x -> isQuoted x && hasTilde x) parts =
             warn id 2147 "Literal tilde in PATH works poorly across programs."
     checkVar _ = return ()
 
-    hasTilde t = fromMaybe False (liftM2 elem (return '~') (getLiteralStringExt (const $ return "") t))
-    isQuoted (T_DoubleQuoted {}) = True
-    isQuoted (T_SingleQuoted {}) = True
+    hasTilde t = '~' `elem` onlyLiteralString t
+    isQuoted T_DoubleQuoted {} = True
+    isQuoted T_SingleQuoted {} = True
     isQuoted _ = False
 checkTildeInPath _ _ = return ()
 
@@ -2309,20 +2705,20 @@ prop_checkUnsupported3 = verify checkUnsupported "#!/bin/sh\ncase foo in bar) ba
 prop_checkUnsupported4 = verify checkUnsupported "#!/bin/ksh\ncase foo in bar) baz ;;& esac"
 prop_checkUnsupported5 = verify checkUnsupported "#!/bin/bash\necho \"${ ls; }\""
 checkUnsupported params t =
-    when (not (null support) && (shellType params `notElem` support)) $
+    unless (null support || (shellType params `elem` support)) $
         report name
  where
     (name, support) = shellSupport t
     report s = err (getId t) 2127 $
         "To use " ++ s ++ ", specify #!/usr/bin/env " ++
-            (map toLower . intercalate " or " . map show $ support)
+            (intercalate " or " . map (map toLower . show) $ support)
 
 -- TODO: Move more of these checks here
 shellSupport t =
   case t of
     T_CaseExpression _ _ list -> forCase (map (\(a,_,_) -> a) list)
     T_DollarBraceCommandExpansion {} -> ("${ ..; } command expansion", [Ksh])
-    otherwise -> ("", [])
+    _ -> ("", [])
   where
     forCase seps | CaseContinue `elem` seps = ("cases with ;;&", [Bash])
     forCase seps | CaseFallThrough `elem` seps = ("cases with ;&", [Bash, Ksh])
@@ -2338,9 +2734,9 @@ checkMultipleAppends params t =
     mapM_ checkList $ getCommandSequences t
   where
     checkList list =
-        mapM_ checkGroup (groupWith (liftM fst) $ map getTarget list)
-    checkGroup (f:_:_:_) | isJust f =
-        style (snd $ fromJust f) 2129
+        mapM_ checkGroup (groupWith (fmap fst) $ map getTarget list)
+    checkGroup (Just (_,id):_:_:_) =
+        style id 2129
             "Consider using { cmd1; cmd2; } >> file instead of individual redirects."
     checkGroup _ = return ()
     getTarget (T_Annotation _ _ t) = getTarget t
@@ -2349,27 +2745,29 @@ checkMultipleAppends params t =
         file <- mapMaybe getAppend list !!! 0
         return (file, id)
     getTarget _ = Nothing
-    getAppend (T_FdRedirect _ _ (T_IoFile _ (T_DGREAT {}) f)) = return f
+    getAppend (T_FdRedirect _ _ (T_IoFile _ T_DGREAT {} f)) = return f
     getAppend _ = Nothing
 
 
 prop_checkSuspiciousIFS1 = verify checkSuspiciousIFS "IFS=\"\\n\""
 prop_checkSuspiciousIFS2 = verifyNot checkSuspiciousIFS "IFS=$'\\t'"
-checkSuspiciousIFS params (T_Assignment id Assign "IFS" [] value) =
-    potentially $ do
-        str <- getLiteralString value
-        return $ check str
+prop_checkSuspiciousIFS3 = verify checkSuspiciousIFS "IFS=' \\t\\n'"
+checkSuspiciousIFS params (T_Assignment _ _ "IFS" [] value) =
+    mapM_ check $ getLiteralString value
   where
-    n = if shellType params == Sh then "'<literal linefeed here>'" else "$'\\n'"
-    t = if shellType params == Sh then "\"$(printf '\\t')\"" else "$'\\t'"
+    hasDollarSingle = shellType params == Bash || shellType params == Ksh
+    n = if hasDollarSingle then  "$'\\n'" else "'<literal linefeed here>'"
+    t = if hasDollarSingle then  "$'\\t'" else "\"$(printf '\\t')\""
     check value =
         case value of
             "\\n" -> suggest n
-            "/n" -> suggest n
             "\\t" -> suggest t
-            "/t" -> suggest t
+            x | '\\' `elem` x -> suggest2 "a literal backslash"
+            x | 'n' `elem` x -> suggest2 "the literal letter 'n'"
+            x | 't' `elem` x -> suggest2 "the literal letter 't'"
             _ -> return ()
-    suggest r = warn id 2141 $ "Did you mean IFS=" ++ r ++ " ?"
+    suggest r = warn (getId value) 2141 $ "This backslash is literal. Did you mean IFS=" ++ r ++ " ?"
+    suggest2 desc = warn (getId value) 2141 $ "This IFS value contains " ++ desc ++ ". For tabs/linefeeds/escapes, use $'..', literal, or printf."
 checkSuspiciousIFS _ _ = return ()
 
 
@@ -2380,7 +2778,7 @@ prop_checkGrepQ4= verifyNot checkShouldUseGrepQ "[ -z $(grep bar | cmd) ]"
 prop_checkGrepQ5= verifyNot checkShouldUseGrepQ "rm $(ls | grep file)"
 prop_checkGrepQ6= verifyNot checkShouldUseGrepQ "[[ -n $(pgrep foo) ]]"
 checkShouldUseGrepQ params t =
-    potentially $ case t of
+    sequence_ $ case t of
         TC_Nullary id _ token -> check id True token
         TC_Unary id _ "-n" token -> check id True token
         TC_Unary id _ "-z" token -> check id False token
@@ -2424,12 +2822,32 @@ prop_checkTestArgumentSplitting12 = verify checkTestArgumentSplitting "[ *.png ]
 prop_checkTestArgumentSplitting13 = verify checkTestArgumentSplitting "[ \"$@\" == \"\" ]"
 prop_checkTestArgumentSplitting14 = verify checkTestArgumentSplitting "[[ \"$@\" == \"\" ]]"
 prop_checkTestArgumentSplitting15 = verifyNot checkTestArgumentSplitting "[[ \"$*\" == \"\" ]]"
+prop_checkTestArgumentSplitting16 = verifyNot checkTestArgumentSplitting "[[ -v foo[123] ]]"
+prop_checkTestArgumentSplitting17 = verifyNot checkTestArgumentSplitting "#!/bin/ksh\n[ -e foo* ]"
+prop_checkTestArgumentSplitting18 = verify checkTestArgumentSplitting "#!/bin/ksh\n[ -d foo* ]"
+prop_checkTestArgumentSplitting19 = verifyNot checkTestArgumentSplitting "[[ var[x] -eq 2*3 ]]"
+prop_checkTestArgumentSplitting20 = verify checkTestArgumentSplitting "[ var[x] -eq 2 ]"
+prop_checkTestArgumentSplitting21 = verify checkTestArgumentSplitting "[ 6 -eq 2*3 ]"
 checkTestArgumentSplitting :: Parameters -> Token -> Writer [TokenComment] ()
-checkTestArgumentSplitting _ t =
+checkTestArgumentSplitting params t =
     case t of
-        (TC_Unary _ _ op token) | isGlob token ->
-            err (getId token) 2144 $
-               op ++ " doesn't work with globs. Use a for loop."
+        (TC_Unary _ typ op token) | isGlob token ->
+            if op == "-v"
+            then
+                when (typ == SingleBracket) $
+                    err (getId token) 2208 $
+                      "Use [[ ]] or quote arguments to -v to avoid glob expansion."
+            else
+                if (typ == SingleBracket && shellType params == Ksh)
+                then
+                    -- Ksh appears to stop processing after unrecognized tokens, so operators
+                    -- will effectively work with globs, but only the first match.
+                    when (op `elem` ['-':c:[] | c <- "bcdfgkprsuwxLhNOGRS" ]) $
+                        warn (getId token) 2245 $
+                            op ++ " only applies to the first expansion of this glob. Use a loop to check any/all."
+                else
+                    err (getId token) 2144 $
+                       op ++ " doesn't work with globs. Use a for loop."
 
         (TC_Nullary _ typ token) -> do
             checkBraces typ token
@@ -2438,6 +2856,18 @@ checkTestArgumentSplitting _ t =
                 checkArrays typ token
 
         (TC_Unary _ typ op token) -> checkAll typ token
+
+        (TC_Binary _ typ op lhs rhs) | op `elem` arithmeticBinaryTestOps ->
+            if typ == DoubleBracket
+            then
+                mapM_ (\c -> do
+                        checkArrays typ c
+                        checkBraces typ c) [lhs, rhs]
+            else
+                mapM_ (\c -> do
+                        checkNumericalGlob typ c
+                        checkArrays typ c
+                        checkBraces typ c) [lhs, rhs]
 
         (TC_Binary _ typ op lhs rhs) ->
             if op `elem` ["=", "==", "!=", "=~"]
@@ -2471,15 +2901,23 @@ checkTestArgumentSplitting _ t =
             then warn (getId token) 2202 "Globs don't work as operands in [ ]. Use a loop."
             else err (getId token) 2203 "Globs are ignored in [[ ]] except right of =/!=. Use a loop."
 
+    checkNumericalGlob SingleBracket token =
+        -- var[x] and x*2 look like globs
+        when (shellType params /= Ksh && isGlob token) $
+            err (getId token) 2255 "[ ] does not apply arithmetic evaluation. Evaluate with $((..)) for numbers, or use string comparator for strings."
+
 
 prop_checkMaskedReturns1 = verify checkMaskedReturns "f() { local a=$(false); }"
 prop_checkMaskedReturns2 = verify checkMaskedReturns "declare a=$(false)"
 prop_checkMaskedReturns3 = verify checkMaskedReturns "declare a=\"`false`\""
-prop_checkMaskedReturns4 = verifyNot checkMaskedReturns "declare a; a=$(false)"
-prop_checkMaskedReturns5 = verifyNot checkMaskedReturns "f() { local -r a=$(false); }"
-checkMaskedReturns _ t@(T_SimpleCommand id _ (cmd:rest)) = potentially $ do
+prop_checkMaskedReturns4 = verify checkMaskedReturns "readonly a=$(false)"
+prop_checkMaskedReturns5 = verify checkMaskedReturns "readonly a=\"`false`\""
+prop_checkMaskedReturns6 = verifyNot checkMaskedReturns "declare a; a=$(false)"
+prop_checkMaskedReturns7 = verifyNot checkMaskedReturns "f() { local -r a=$(false); }"
+prop_checkMaskedReturns8 = verifyNot checkMaskedReturns "a=$(false); readonly a"
+checkMaskedReturns _ t@(T_SimpleCommand id _ (cmd:rest)) = sequence_ $ do
     name <- getCommandName t
-    guard $ name `elem` ["declare", "export"]
+    guard $ name `elem` ["declare", "export", "readonly"]
         || name == "local" && "r" `notElem` map snd (getAllFlags t)
     return $ mapM_ checkArgs rest
   where
@@ -2496,51 +2934,87 @@ checkMaskedReturns _ _ = return ()
 
 prop_checkReadWithoutR1 = verify checkReadWithoutR "read -a foo"
 prop_checkReadWithoutR2 = verifyNot checkReadWithoutR "read -ar foo"
-checkReadWithoutR _ t@(T_SimpleCommand {}) | t `isUnqualifiedCommand` "read" =
-    unless ("r" `elem` map snd (getAllFlags t)) $
-        info (getId t) 2162 "read without -r will mangle backslashes."
+prop_checkReadWithoutR3 = verifyNot checkReadWithoutR "read -t 0"
+prop_checkReadWithoutR4 = verifyNot checkReadWithoutR "read -t 0 && read --d '' -r bar"
+prop_checkReadWithoutR5 = verifyNot checkReadWithoutR "read -t 0 foo < file.txt"
+prop_checkReadWithoutR6 = verifyNot checkReadWithoutR "read -u 3 -t 0"
+checkReadWithoutR _ t@T_SimpleCommand {} | t `isUnqualifiedCommand` "read"
+    && "r" `notElem` map snd flags && not has_t0 =
+        info (getId $ getCommandTokenOrThis t) 2162 "read without -r will mangle backslashes."
+  where
+    flags = getAllFlags t
+    has_t0 = Just "0" == do
+        parsed <- getGnuOpts flagsForRead $ arguments t
+        (_, t) <- lookup "t" parsed
+        getLiteralString t
+
 checkReadWithoutR _ _ = return ()
 
-prop_checkUncheckedCd1 = verifyTree checkUncheckedCd "cd ~/src; rm -r foo"
-prop_checkUncheckedCd2 = verifyNotTree checkUncheckedCd "cd ~/src || exit; rm -r foo"
-prop_checkUncheckedCd3 = verifyNotTree checkUncheckedCd "set -e; cd ~/src; rm -r foo"
-prop_checkUncheckedCd4 = verifyNotTree checkUncheckedCd "if cd foo; then rm foo; fi"
-prop_checkUncheckedCd5 = verifyTree checkUncheckedCd "if true; then cd foo; fi"
-prop_checkUncheckedCd6 = verifyNotTree checkUncheckedCd "cd .."
-prop_checkUncheckedCd7 = verifyNotTree checkUncheckedCd "#!/bin/bash -e\ncd foo\nrm bar"
-prop_checkUncheckedCd8 = verifyNotTree checkUncheckedCd "set -o errexit; cd foo; rm bar"
-checkUncheckedCd params root =
-    if hasSetE then [] else execWriter $ doAnalysis checkElement root
+prop_checkUncheckedCd1 = verifyTree checkUncheckedCdPushdPopd "cd ~/src; rm -r foo"
+prop_checkUncheckedCd2 = verifyNotTree checkUncheckedCdPushdPopd "cd ~/src || exit; rm -r foo"
+prop_checkUncheckedCd3 = verifyNotTree checkUncheckedCdPushdPopd "set -e; cd ~/src; rm -r foo"
+prop_checkUncheckedCd4 = verifyNotTree checkUncheckedCdPushdPopd "if cd foo; then rm foo; fi"
+prop_checkUncheckedCd5 = verifyTree checkUncheckedCdPushdPopd "if true; then cd foo; fi"
+prop_checkUncheckedCd6 = verifyNotTree checkUncheckedCdPushdPopd "cd .."
+prop_checkUncheckedCd7 = verifyNotTree checkUncheckedCdPushdPopd "#!/bin/bash -e\ncd foo\nrm bar"
+prop_checkUncheckedCd8 = verifyNotTree checkUncheckedCdPushdPopd "set -o errexit; cd foo; rm bar"
+prop_checkUncheckedCd9 = verifyTree checkUncheckedCdPushdPopd "builtin cd ~/src; rm -r foo"
+prop_checkUncheckedPushd1 = verifyTree checkUncheckedCdPushdPopd "pushd ~/src; rm -r foo"
+prop_checkUncheckedPushd2 = verifyNotTree checkUncheckedCdPushdPopd "pushd ~/src || exit; rm -r foo"
+prop_checkUncheckedPushd3 = verifyNotTree checkUncheckedCdPushdPopd "set -e; pushd ~/src; rm -r foo"
+prop_checkUncheckedPushd4 = verifyNotTree checkUncheckedCdPushdPopd "if pushd foo; then rm foo; fi"
+prop_checkUncheckedPushd5 = verifyTree checkUncheckedCdPushdPopd "if true; then pushd foo; fi"
+prop_checkUncheckedPushd6 = verifyNotTree checkUncheckedCdPushdPopd "pushd .."
+prop_checkUncheckedPushd7 = verifyNotTree checkUncheckedCdPushdPopd "#!/bin/bash -e\npushd foo\nrm bar"
+prop_checkUncheckedPushd8 = verifyNotTree checkUncheckedCdPushdPopd "set -o errexit; pushd foo; rm bar"
+prop_checkUncheckedPushd9 = verifyNotTree checkUncheckedCdPushdPopd "pushd -n foo"
+prop_checkUncheckedPopd1 = verifyTree checkUncheckedCdPushdPopd "popd; rm -r foo"
+prop_checkUncheckedPopd2 = verifyNotTree checkUncheckedCdPushdPopd "popd || exit; rm -r foo"
+prop_checkUncheckedPopd3 = verifyNotTree checkUncheckedCdPushdPopd "set -e; popd; rm -r foo"
+prop_checkUncheckedPopd4 = verifyNotTree checkUncheckedCdPushdPopd "if popd; then rm foo; fi"
+prop_checkUncheckedPopd5 = verifyTree checkUncheckedCdPushdPopd "if true; then popd; fi"
+prop_checkUncheckedPopd6 = verifyTree checkUncheckedCdPushdPopd "popd"
+prop_checkUncheckedPopd7 = verifyNotTree checkUncheckedCdPushdPopd "#!/bin/bash -e\npopd\nrm bar"
+prop_checkUncheckedPopd8 = verifyNotTree checkUncheckedCdPushdPopd "set -o errexit; popd; rm bar"
+prop_checkUncheckedPopd9 = verifyNotTree checkUncheckedCdPushdPopd "popd -n foo"
+prop_checkUncheckedPopd10 = verifyNotTree checkUncheckedCdPushdPopd "cd ../.."
+prop_checkUncheckedPopd11 = verifyNotTree checkUncheckedCdPushdPopd "cd ../.././.."
+prop_checkUncheckedPopd12 = verifyNotTree checkUncheckedCdPushdPopd "cd /"
+prop_checkUncheckedPopd13 = verifyTree checkUncheckedCdPushdPopd "cd ../../.../.."
+
+checkUncheckedCdPushdPopd params root =
+    if hasSetE params then
+        []
+    else execWriter $ doAnalysis checkElement root
   where
-    checkElement t@(T_SimpleCommand {}) =
-        when(t `isUnqualifiedCommand` "cd"
-            && not (isCdDotDot t)
-            && not (isCondition $ getPath (parentMap params) t)) $
-                warn (getId t) 2164 "Use 'cd ... || exit' or 'cd ... || return' in case cd fails."
+    checkElement t@T_SimpleCommand {}
+        | name `elem` ["cd", "pushd", "popd"]
+            && not (isSafeDir t)
+            && not (name `elem` ["pushd", "popd"] && ("n" `elem` map snd (getAllFlags t)))
+            && not (isCondition $ getPath (parentMap params) t) =
+                warnWithFix (getId t) 2164
+                    ("Use '" ++ name ++ " ... || exit' or '" ++ name ++ " ... || return' in case " ++ name ++ " fails.")
+                    (fixWith [replaceEnd (getId t) params 0 " || exit"])
+        where name = getName t
     checkElement _ = return ()
-    isCdDotDot t = oversimplify t == ["cd", ".."]
-    hasSetE = isNothing $ doAnalysis (guard . not . isSetE) root
-    isSetE t =
-        case t of
-            T_Script _ str _ -> str `matches` re
-            T_SimpleCommand {}  ->
-                t `isUnqualifiedCommand` "set" &&
-                    ("errexit" `elem` oversimplify t || "e" `elem` map snd (getAllFlags t))
-            _ -> False
-    re = mkRegex "[[:space:]]-[^-]*e"
+    getName t = fromMaybe "" $ getCommandName t
+    isSafeDir t = case oversimplify t of
+          [_, str] -> str `matches` regex
+          _ -> False
+    regex = mkRegex "^/*((\\.|\\.\\.)/+)*(\\.|\\.\\.)?$"
 
 prop_checkLoopVariableReassignment1 = verify checkLoopVariableReassignment "for i in *; do for i in *.bar; do true; done; done"
 prop_checkLoopVariableReassignment2 = verify checkLoopVariableReassignment "for i in *; do for((i=0; i<3; i++)); do true; done; done"
 prop_checkLoopVariableReassignment3 = verifyNot checkLoopVariableReassignment "for i in *; do for j in *.bar; do true; done; done"
 checkLoopVariableReassignment params token =
-    potentially $ case token of
+    sequence_ $ case token of
         T_ForIn {} -> check
         T_ForArithmetic {} -> check
         _ -> Nothing
   where
     check = do
         str <- loopVariable token
-        next <- listToMaybe $ filter (\x -> loopVariable x == Just str) path
+        next <- find (\x -> loopVariable x == Just str) path
         return $ do
             warn (getId token) 2165 "This nested loop overrides the index variable of its parent."
             warn (getId next)  2167 "This parent loop has its index variable overridden."
@@ -2552,7 +3026,7 @@ checkLoopVariableReassignment params token =
             T_ForArithmetic _
                 (TA_Sequence _
                     [TA_Assignment _ "="
-                        (TA_Expansion _ [T_Literal _ var]) _])
+                        (TA_Variable _ var _ ) _])
                             _ _ _ -> return var
             _ -> fail "not loop"
 
@@ -2564,18 +3038,17 @@ prop_checkTrailingBracket5 = verifyNot checkTrailingBracket "run bar ']'"
 checkTrailingBracket _ token =
     case token of
         T_SimpleCommand _ _ tokens@(_:_) -> check (last tokens) token
-        otherwise -> return ()
+        _ -> return ()
   where
-    check t command =
-        case t of
-            T_NormalWord id [T_Literal _ str] -> potentially $ do
-                guard $ str `elem` [ "]]", "]" ]
-                let opposite = invert str
-                    parameters = oversimplify command
-                guard $ opposite `notElem` parameters
-                return $ warn id 2171 $
-                    "Found trailing " ++ str ++ " outside test. Missing " ++ opposite ++ "?"
-            otherwise -> return ()
+    check (T_NormalWord id [T_Literal _ str]) command
+        | str `elem` [ "]]", "]" ]
+        && opposite `notElem` parameters
+        = warn id 2171 $
+            "Found trailing " ++ str ++ " outside test. Add missing " ++ opposite ++ " or quote if intentional."
+        where
+            opposite = invert str
+            parameters = oversimplify command
+    check _ _ = return ()
     invert s =
         case s of
             "]]" -> "[["
@@ -2595,11 +3068,11 @@ checkReturnAgainstZero _ token =
     case token of
         TC_Binary id _ _ lhs rhs -> check lhs rhs
         TA_Binary id _ lhs rhs -> check lhs rhs
-        TA_Unary id _ exp ->
-            when (isExitCode exp) $ message (getId exp)
-        TA_Sequence _ [exp] ->
-            when (isExitCode exp) $ message (getId exp)
-        otherwise -> return ()
+        TA_Unary id _ exp
+            | isExitCode exp -> message (getId exp)
+        TA_Sequence _ [exp]
+            | isExitCode exp -> message (getId exp)
+        _ -> return ()
   where
     check lhs rhs =
         if isZero rhs && isExitCode lhs
@@ -2608,8 +3081,8 @@ checkReturnAgainstZero _ token =
     isZero t = getLiteralString t == Just "0"
     isExitCode t =
         case getWordParts t of
-            [exp@(T_DollarBraced {})] -> bracedString exp == "?"
-            otherwise -> False
+            [T_DollarBraced _ _ l] -> concat (oversimplify l) == "?"
+            _ -> False
     message id = style id 2181 "Check exit code directly with e.g. 'if mycmd;', not indirectly with $?."
 
 prop_checkRedirectedNowhere1 = verify checkRedirectedNowhere "> file"
@@ -2622,12 +3095,12 @@ prop_checkRedirectedNowhere7 = verifyNot checkRedirectedNowhere "var=$(< file)"
 prop_checkRedirectedNowhere8 = verifyNot checkRedirectedNowhere "var=`< file`"
 checkRedirectedNowhere params token =
     case token of
-        T_Pipeline _ _ [single] -> potentially $ do
+        T_Pipeline _ _ [single] -> sequence_ $ do
             redir <- getDanglingRedirect single
             guard . not $ isInExpansion token
             return $ warn (getId redir) 2188 "This redirection doesn't have a command. Move to its command (or use 'true' as no-op)."
 
-        T_Pipeline _ _ list -> forM_ list $ \x -> potentially $ do
+        T_Pipeline _ _ list -> forM_ list $ \x -> sequence_ $ do
             redir <- getDanglingRedirect x
             return $ err (getId redir) 2189 "You can't have | between this redirection and the command it should apply to."
 
@@ -2637,7 +3110,7 @@ checkRedirectedNowhere params token =
         case drop 1 $ getPath (parentMap params) t of
             T_DollarExpansion _ [_] : _ -> True
             T_Backticked _ [_] : _ -> True
-            T_Annotation _ _ u : _ -> isInExpansion u
+            t@T_Annotation {} : _ -> isInExpansion t
             _ -> False
     getDanglingRedirect token =
         case token of
@@ -2651,9 +3124,13 @@ prop_checkArrayAssignmentIndices3 = verifyNotTree checkArrayAssignmentIndices "d
 prop_checkArrayAssignmentIndices4 = verifyTree checkArrayAssignmentIndices "typeset -A foo; foo+=(bar)"
 prop_checkArrayAssignmentIndices5 = verifyTree checkArrayAssignmentIndices "arr=( [foo]= bar )"
 prop_checkArrayAssignmentIndices6 = verifyTree checkArrayAssignmentIndices "arr=( [foo] = bar )"
-prop_checkArrayAssignmentIndices7 = verifyTree checkArrayAssignmentIndices "arr=( var=value )"
+prop_checkArrayAssignmentIndices7 = verifyNotTree checkArrayAssignmentIndices "arr=( var=value )"
 prop_checkArrayAssignmentIndices8 = verifyNotTree checkArrayAssignmentIndices "arr=( [foo]=bar )"
 prop_checkArrayAssignmentIndices9 = verifyNotTree checkArrayAssignmentIndices "arr=( [foo]=\"\" )"
+prop_checkArrayAssignmentIndices10 = verifyTree checkArrayAssignmentIndices "declare -A arr; arr=( var=value )"
+prop_checkArrayAssignmentIndices11 = verifyTree checkArrayAssignmentIndices "arr=( 1=value )"
+prop_checkArrayAssignmentIndices12 = verifyTree checkArrayAssignmentIndices "arr=( $a=value )"
+prop_checkArrayAssignmentIndices13 = verifyTree checkArrayAssignmentIndices "arr=( $((1+1))=value )"
 checkArrayAssignmentIndices params root =
     runNodeAnalysis check params root
   where
@@ -2674,39 +3151,69 @@ checkArrayAssignmentIndices params root =
 
             T_NormalWord _ parts ->
                 let literalEquals = do
-                    part <- parts
-                    (id, str) <- case part of
-                        T_Literal id str -> [(id,str)]
-                        _ -> []
-                    guard $ '=' `elem` str
-                    return $ warn id 2191 "The = here is literal. To assign by index, use ( [index]=value ) with no spaces. To keep as literal, quote it."
+                    T_Literal id str <- parts
+                    let (before, after) = break ('=' ==) str
+                    guard $ all isDigit before && not (null after)
+                    return $ warnWithFix id 2191 "The = here is literal. To assign by index, use ( [index]=value ) with no spaces. To keep as literal, quote it." (surroundWidth id params "\"")
                 in
-                    if (null literalEquals && isAssociative)
+                    if null literalEquals && isAssociative
                     then warn (getId t) 2190 "Elements in associative arrays need index, e.g. array=( [index]=value ) ."
                     else sequence_ literalEquals
 
             _ -> return ()
 
+
 prop_checkUnmatchableCases1 = verify checkUnmatchableCases "case foo in bar) true; esac"
 prop_checkUnmatchableCases2 = verify checkUnmatchableCases "case foo-$bar in ??|*) true; esac"
 prop_checkUnmatchableCases3 = verify checkUnmatchableCases "case foo in foo) true; esac"
 prop_checkUnmatchableCases4 = verifyNot checkUnmatchableCases "case foo-$bar in foo*|*bar|*baz*) true; esac"
-checkUnmatchableCases _ t =
+prop_checkUnmatchableCases5 = verify checkUnmatchableCases "case $f in *.txt) true;; f??.txt) false;; esac"
+prop_checkUnmatchableCases6 = verifyNot checkUnmatchableCases "case $f in ?*) true;; *) false;; esac"
+prop_checkUnmatchableCases7 = verifyNot checkUnmatchableCases "case $f in $(x)) true;; asdf) false;; esac"
+prop_checkUnmatchableCases8 = verify checkUnmatchableCases "case $f in cow) true;; bar|cow) false;; esac"
+prop_checkUnmatchableCases9 = verifyNot checkUnmatchableCases "case $f in x) true;;& x) false;; esac"
+checkUnmatchableCases params t =
     case t of
-        T_CaseExpression _ word list ->
+        T_CaseExpression _ word list -> do
+            -- Check all patterns for whether they can ever match
+            let allpatterns  = concatMap snd3 list
+            -- Check only the non-fallthrough branches for shadowing
+            let breakpatterns = concatMap snd3 $ filter (\x -> fst3 x == CaseBreak) list
+
             if isConstant word
-            then warn (getId word) 2194
-                    "This word is constant. Did you forget the $ on a variable?"
-            else  potentially $ do
-                pg <- wordToPseudoGlob word
-                return $ mapM_ (check pg) (concatMap (\(_,x,_) -> x) list)
+                then warn (getId word) 2194
+                        "This word is constant. Did you forget the $ on a variable?"
+                else mapM_ (check $ wordToPseudoGlob word) allpatterns
+
+            let exactGlobs = tupMap wordToExactPseudoGlob breakpatterns
+            let fuzzyGlobs = tupMap wordToPseudoGlob breakpatterns
+            let dominators = zip exactGlobs (tails $ drop 1 fuzzyGlobs)
+
+            mapM_ checkDoms dominators
+
         _ -> return ()
   where
-    check target candidate = potentially $ do
-        candidateGlob <- wordToPseudoGlob candidate
-        guard . not $ pseudoGlobsCanOverlap target candidateGlob
-        return $ warn (getId candidate) 2195
-                    "This pattern will never match the case statement's word. Double check them."
+    fst3 (x,_,_) = x
+    snd3 (_,x,_) = x
+    tp = tokenPositions params
+    check target candidate = unless (pseudoGlobsCanOverlap target $ wordToPseudoGlob candidate) $
+        warn (getId candidate) 2195
+            "This pattern will never match the case statement's word. Double check them."
+
+    tupMap f l = map (\x -> (x, f x)) l
+    checkDoms ((glob, Just x), rest) =
+        forM_ (find (\(_, p) -> x `pseudoGlobIsSuperSetof` p) rest) $
+            \(first,_) -> do
+                warn (getId glob) 2221 $ "This pattern always overrides a later one" <> patternContext (getId first)
+                warn (getId first) 2222 $ "This pattern never matches because of a previous pattern" <> patternContext (getId glob)
+      where
+        patternContext :: Id -> String
+        patternContext id =
+            case posLine . fst <$> Map.lookup id tp of
+              Just l -> " on line " <> show l <> "."
+              _      -> "."
+    checkDoms _ = return ()
+
 
 prop_checkSubshellAsTest1 = verify checkSubshellAsTest "( -e file )"
 prop_checkSubshellAsTest2 = verify checkSubshellAsTest "( 1 -gt 2 )"
@@ -2730,10 +3237,768 @@ checkSubshellAsTest _ t =
 
 
     checkParams id first second = do
-        when (fromMaybe False $ (`elem` unaryTestOps) <$> getLiteralString first) $
+        when (maybe False (`elem` unaryTestOps) $ getLiteralString first) $
             err id 2204 "(..) is a subshell. Did you mean [ .. ], a test expression?"
-        when (fromMaybe False $ (`elem` binaryTestOps) <$> getLiteralString second) $
+        when (maybe False (`elem` binaryTestOps) $ getLiteralString second) $
             warn id 2205 "(..) is a subshell. Did you mean [ .. ], a test expression?"
+
+
+prop_checkSplittingInArrays1 = verify checkSplittingInArrays "a=( $var )"
+prop_checkSplittingInArrays2 = verify checkSplittingInArrays "a=( $(cmd) )"
+prop_checkSplittingInArrays3 = verifyNot checkSplittingInArrays "a=( \"$var\" )"
+prop_checkSplittingInArrays4 = verifyNot checkSplittingInArrays "a=( \"$(cmd)\" )"
+prop_checkSplittingInArrays5 = verifyNot checkSplittingInArrays "a=( $! $$ $# )"
+prop_checkSplittingInArrays6 = verifyNot checkSplittingInArrays "a=( ${#arr[@]} )"
+prop_checkSplittingInArrays7 = verifyNot checkSplittingInArrays "a=( foo{1,2} )"
+prop_checkSplittingInArrays8 = verifyNot checkSplittingInArrays "a=( * )"
+checkSplittingInArrays params t =
+    case t of
+        T_Array _ elements -> mapM_ check elements
+        _ -> return ()
+  where
+    check word = case word of
+        T_NormalWord _ parts -> mapM_ checkPart parts
+        _ -> return ()
+    checkPart part = case part of
+        T_DollarExpansion id _ -> forCommand id
+        T_DollarBraceCommandExpansion id _ -> forCommand id
+        T_Backticked id _ -> forCommand id
+        T_DollarBraced id _ str |
+            not (isCountingReference part)
+            && not (isQuotedAlternativeReference part)
+            && getBracedReference (concat $ oversimplify str) `notElem` variablesWithoutSpaces
+            -> warn id 2206 $
+                if shellType params == Ksh
+                then "Quote to prevent word splitting/globbing, or split robustly with read -A or while read."
+                else "Quote to prevent word splitting/globbing, or split robustly with mapfile or read -a."
+        _ -> return ()
+
+    forCommand id =
+        warn id 2207 $
+            if shellType params == Ksh
+            then "Prefer read -A or while read to split command output (or quote to avoid splitting)."
+            else "Prefer mapfile or read -a to split command output (or quote to avoid splitting)."
+
+
+prop_checkRedirectionToNumber1 = verify checkRedirectionToNumber "( 1 > 2 )"
+prop_checkRedirectionToNumber2 = verify checkRedirectionToNumber "foo 1>2"
+prop_checkRedirectionToNumber3 = verifyNot checkRedirectionToNumber "echo foo > '2'"
+prop_checkRedirectionToNumber4 = verifyNot checkRedirectionToNumber "foo 1>&2"
+checkRedirectionToNumber _ t = case t of
+    T_IoFile id _ word -> sequence_ $ do
+        file <- getUnquotedLiteral word
+        guard $ all isDigit file
+        return $ warn id 2210 "This is a file redirection. Was it supposed to be a comparison or fd operation?"
+    _ -> return ()
+
+prop_checkGlobAsCommand1 = verify checkGlobAsCommand "foo*"
+prop_checkGlobAsCommand2 = verify checkGlobAsCommand "$(var[i])"
+prop_checkGlobAsCommand3 = verifyNot checkGlobAsCommand "echo foo*"
+checkGlobAsCommand _ t = case t of
+    T_SimpleCommand _ _ (first:_)
+        | isGlob first ->
+            warn (getId first) 2211 "This is a glob used as a command name. Was it supposed to be in ${..}, array, or is it missing quoting?"
+    _ -> return ()
+
+
+prop_checkFlagAsCommand1 = verify checkFlagAsCommand "-e file"
+prop_checkFlagAsCommand2 = verify checkFlagAsCommand "foo\n  --bar=baz"
+prop_checkFlagAsCommand3 = verifyNot checkFlagAsCommand "'--myexec--' args"
+prop_checkFlagAsCommand4 = verifyNot checkFlagAsCommand "var=cmd --arg"  -- Handled by SC2037
+checkFlagAsCommand _ t = case t of
+    T_SimpleCommand _ [] (first:_)
+        | isUnquotedFlag first ->
+            warn (getId first) 2215 "This flag is used as a command name. Bad line break or missing [ .. ]?"
+    _ -> return ()
+
+
+prop_checkEmptyCondition1 = verify checkEmptyCondition "if [ ]; then ..; fi"
+prop_checkEmptyCondition2 = verifyNot checkEmptyCondition "[ foo -o bar ]"
+checkEmptyCondition _ t = case t of
+    TC_Empty id _ -> style id 2212 "Use 'false' instead of empty [/[[ conditionals."
+    _ -> return ()
+
+prop_checkPipeToNowhere1 = verify checkPipeToNowhere "foo | echo bar"
+prop_checkPipeToNowhere2 = verify checkPipeToNowhere "basename < file.txt"
+prop_checkPipeToNowhere3 = verify checkPipeToNowhere "printf 'Lol' <<< str"
+prop_checkPipeToNowhere4 = verify checkPipeToNowhere "printf 'Lol' << eof\nlol\neof\n"
+prop_checkPipeToNowhere5 = verifyNot checkPipeToNowhere "echo foo | xargs du"
+prop_checkPipeToNowhere6 = verifyNot checkPipeToNowhere "ls | echo $(cat)"
+prop_checkPipeToNowhere7 = verifyNot checkPipeToNowhere "echo foo | var=$(cat) ls"
+prop_checkPipeToNowhere8 = verify checkPipeToNowhere "foo | true"
+prop_checkPipeToNowhere9 = verifyNot checkPipeToNowhere "mv -i f . < /dev/stdin"
+prop_checkPipeToNowhere10 = verify checkPipeToNowhere "ls > file | grep foo"
+prop_checkPipeToNowhere11 = verify checkPipeToNowhere "ls | grep foo < file"
+prop_checkPipeToNowhere12 = verify checkPipeToNowhere "ls > foo > bar"
+prop_checkPipeToNowhere13 = verify checkPipeToNowhere "ls > foo 2> bar > baz"
+prop_checkPipeToNowhere14 = verify checkPipeToNowhere "ls > foo &> bar"
+prop_checkPipeToNowhere15 = verifyNot checkPipeToNowhere "ls > foo 2> bar |& grep 'No space left'"
+prop_checkPipeToNowhere16 = verifyNot checkPipeToNowhere "echo World | cat << EOF\nhello $(cat)\nEOF\n"
+prop_checkPipeToNowhere17 = verify checkPipeToNowhere "echo World | cat << 'EOF'\nhello $(cat)\nEOF\n"
+prop_checkPipeToNowhere18 = verifyNot checkPipeToNowhere "ls 1>&3 3>&1 3>&- | wc -l"
+prop_checkPipeToNowhere19 = verifyNot checkPipeToNowhere "find . -print0 | du --files0-from=/dev/stdin"
+prop_checkPipeToNowhere20 = verifyNot checkPipeToNowhere "find . | du --exclude-from=/dev/fd/0"
+
+data PipeType = StdoutPipe | StdoutStderrPipe | NoPipe deriving (Eq)
+checkPipeToNowhere :: Parameters -> Token -> WriterT [TokenComment] Identity ()
+checkPipeToNowhere params t =
+    case t of
+        T_Pipeline _ pipes cmds ->
+            mapM_ checkPipe $ commandsWithContext pipes cmds
+        T_Redirecting _ redirects cmd | any redirectsStdin redirects -> checkRedir cmd
+        _ -> return ()
+  where
+    checkPipe (input, stage, output) = do
+        let hasConsumers = hasAdditionalConsumers stage
+        let hasProducers = hasAdditionalProducers stage
+
+        sequence_ $ do
+            cmd <- getCommand stage
+            name <- getCommandBasename cmd
+            guard $ name `elem` nonReadingCommands
+            guard $ not hasConsumers && input /= NoPipe
+            guard . not $ commandSpecificException name cmd
+
+            -- Confusing echo for cat is so common that it's worth a special case
+            let suggestion =
+                    if name == "echo"
+                    then "Did you want 'cat' instead?"
+                    else "Wrong command or missing xargs?"
+            return $ warn (getId cmd) 2216 $
+                "Piping to '" ++ name ++ "', a command that doesn't read stdin. " ++ suggestion
+
+        sequence_ $ do
+            T_Redirecting _ redirs cmd <- return stage
+            fds <- sequence $ map getRedirectionFds redirs
+
+            let fdAndToken :: [(Integer, Token)]
+                fdAndToken =
+                  concatMap (\(list, redir) -> map (\n -> (n, redir)) list) $
+                    zip fds redirs
+
+            let fdMap =
+                  Map.fromListWith (++) $
+                    map (\(a,b) -> (a,[b])) fdAndToken
+
+            let inputWarning = sequence_ $ do
+                    guard $ input /= NoPipe && not hasConsumers
+                    (override:_) <- Map.lookup 0 fdMap
+                    return $ err (getOpId override) 2259 $
+                        "This redirection overrides piped input. To use both, merge or pass filenames."
+
+            -- Only produce output warnings for regular pipes, since these are
+            -- way more common, and  `foo > out 2> err |& foo` can still write
+            -- to stderr if the files fail to open
+            let outputWarning = sequence_ $ do
+                    guard $ output == StdoutPipe && not hasProducers
+                    (override:_) <- Map.lookup 1 fdMap
+                    return $ err (getOpId override) 2260 $
+                        "This redirection overrides the output pipe. Use 'tee' to output to both."
+
+            return $ do
+                inputWarning
+                outputWarning
+                mapM_ warnAboutDupes $ Map.assocs fdMap
+
+    commandSpecificException name cmd =
+        case name of
+            "du" -> any (`elem` ["exclude-from", "files0-from"]) $ map snd $ getAllFlags cmd
+            _ -> False
+
+    warnAboutDupes (n, list@(_:_:_)) =
+        forM_ list $ \c -> err (getOpId c) 2261 $
+            "Multiple redirections compete for " ++ str n ++ ". Use cat, tee, or pass filenames instead."
+    warnAboutDupes _ = return ()
+
+    alternative =
+        if shellType params `elem` [Bash, Ksh]
+        then "process substitutions or temp files"
+        else "temporary files"
+
+    str n =
+        case n of
+            0 -> "stdin"
+            1 -> "stdout"
+            2 -> "stderr"
+            _ -> "FD " ++ show n
+
+    checkRedir cmd = sequence_ $ do
+        name <- getCommandBasename cmd
+        guard $ name `elem` nonReadingCommands
+        guard . not $ hasAdditionalConsumers cmd
+        guard . not $ name `elem` ["cp", "mv", "rm"] && cmd `hasFlag` "i"
+        let suggestion =
+                if name == "echo"
+                then "Did you want 'cat' instead?"
+                else "Bad quoting, wrong command or missing xargs?"
+        return $ warn (getId cmd) 2217 $
+            "Redirecting to '" ++ name ++ "', a command that doesn't read stdin. " ++ suggestion
+
+    -- Could any words in a SimpleCommand consume stdin (e.g. echo "$(cat)")?
+    hasAdditionalConsumers = treeContains mayConsume
+    -- Could any words in a SimpleCommand produce stdout? E.g. >(tee foo)
+    hasAdditionalProducers = treeContains mayProduce
+    treeContains pred t = isNothing $
+        doAnalysis (guard . not . pred) t
+
+    mayConsume t =
+        case t of
+            T_ProcSub _ "<" _ -> True
+            T_Backticked {} -> True
+            T_DollarExpansion {} -> True
+            _ -> False
+
+    mayProduce t =
+        case t of
+            T_ProcSub _ ">" _ -> True
+            _ -> False
+
+    getOpId t =
+        case t of
+            T_FdRedirect _ _ x -> getOpId x
+            T_IoFile _ op _ -> getId op
+            _ -> getId t
+
+    getRedirectionFds t =
+        case t of
+            T_FdRedirect _ "" x -> getDefaultFds x
+            T_FdRedirect _ "&" _ -> return [1, 2]
+            T_FdRedirect _ num x | all isDigit num ->
+                -- Don't report the number unless we know what it is.
+                -- This avoids triggering on 3>&1 1>&3
+                getDefaultFds x *> return [read num]
+            -- Don't bother with {fd}>42 and such
+            _ -> Nothing
+
+    getDefaultFds redir =
+        case redir of
+            T_HereDoc {} -> return [0]
+            T_HereString {} -> return [0]
+            T_IoFile _ op _ ->
+                case op of
+                    T_Less {} -> return [0]
+                    T_Greater {} -> return [1]
+                    T_DGREAT {} -> return [1]
+                    T_GREATAND {} -> return [1, 2]
+                    T_CLOBBER {} -> return [1]
+                    T_IoDuplicate _ op "-" -> getDefaultFds op
+                    _ -> Nothing
+            _ -> Nothing
+
+    redirectsStdin t =
+        fromMaybe False $ do
+            fds <- getRedirectionFds t
+            return $ 0 `elem` fds
+
+    pipeType t =
+        case t of
+            T_Pipe _ "|" -> StdoutPipe
+            T_Pipe _ "|&" -> StdoutStderrPipe
+            _ -> NoPipe
+
+    commandsWithContext pipes cmds =
+        let pipeTypes = map pipeType pipes
+            inputs = NoPipe : pipeTypes
+            outputs = pipeTypes ++ [NoPipe]
+        in
+            zip3 inputs cmds outputs
+
+prop_checkUseBeforeDefinition1 = verifyTree checkUseBeforeDefinition "f; f() { true; }"
+prop_checkUseBeforeDefinition2 = verifyNotTree checkUseBeforeDefinition "f() { true; }; f"
+prop_checkUseBeforeDefinition3 = verifyNotTree checkUseBeforeDefinition "if ! mycmd --version; then mycmd() { true; }; fi"
+prop_checkUseBeforeDefinition4 = verifyNotTree checkUseBeforeDefinition "mycmd || mycmd() { f; }"
+checkUseBeforeDefinition _ t =
+    execWriter $ evalStateT (mapM_ examine $ revCommands) Map.empty
+  where
+    examine t = case t of
+        T_Pipeline _ _ [T_Redirecting _ _ (T_Function _ _ _ name _)] ->
+            modify $ Map.insert name t
+        T_Annotation _ _ w -> examine w
+        T_Pipeline _ _ cmds -> do
+            m <- get
+            unless (Map.null m) $
+                mapM_ (checkUsage m) $ concatMap recursiveSequences cmds
+        _ -> return ()
+
+    checkUsage map cmd = sequence_ $ do
+        name <- getCommandName cmd
+        def <- Map.lookup name map
+        return $
+            err (getId cmd) 2218
+                "This function is only defined later. Move the definition up."
+
+    revCommands = reverse $ concat $ getCommandSequences t
+    recursiveSequences x =
+        let list = concat $ getCommandSequences x in
+            if null list
+            then [x]
+            else concatMap recursiveSequences list
+
+prop_checkForLoopGlobVariables1 = verify checkForLoopGlobVariables "for i in $var/*.txt; do true; done"
+prop_checkForLoopGlobVariables2 = verifyNot checkForLoopGlobVariables "for i in \"$var\"/*.txt; do true; done"
+prop_checkForLoopGlobVariables3 = verifyNot checkForLoopGlobVariables "for i in $var; do true; done"
+checkForLoopGlobVariables _ t =
+    case t of
+        T_ForIn _ _ words _ -> mapM_ check words
+        _ -> return ()
+  where
+    check (T_NormalWord _ parts) =
+        when (any isGlob parts) $
+            mapM_ suggest $ filter isQuoteableExpansion parts
+    suggest t = info (getId t) 2231
+        "Quote expansions in this for loop glob to prevent wordsplitting, e.g. \"$dir\"/*.txt ."
+
+prop_checkSubshelledTests1 = verify checkSubshelledTests "a && ( [ b ] || ! [ c ] )"
+prop_checkSubshelledTests2 = verify checkSubshelledTests "( [ a ] )"
+prop_checkSubshelledTests3 = verify checkSubshelledTests "( [ a ] && [ b ] || test c )"
+prop_checkSubshelledTests4 = verify checkSubshelledTests "( [ a ] && { [ b ] && [ c ]; } )"
+checkSubshelledTests params t =
+    case t of
+        T_Subshell id list | all isTestStructure list ->
+            case () of
+                -- Special case for if (test) and while (test)
+                _ | isCompoundCondition (getPath (parentMap params) t) ->
+                    style id 2233 "Remove superfluous (..) around condition."
+
+                -- Special case for ([ x ])
+                _ | isSingleTest list ->
+                    style id 2234 "Remove superfluous (..) around test command."
+
+                -- General case for ([ x ] || [ y ] && etc)
+                _ -> style id 2235 "Use { ..; } instead of (..) to avoid subshell overhead."
+        _ -> return ()
+  where
+
+    isSingleTest cmds =
+        case cmds of
+            [c] | isTestCommand c -> True
+            _ -> False
+
+    isTestStructure t =
+        case t of
+            T_Banged _ t -> isTestStructure t
+            T_AndIf _ a b -> isTestStructure a && isTestStructure b
+            T_OrIf  _ a b -> isTestStructure a && isTestStructure b
+            T_Pipeline _ [] [T_Redirecting _ _ cmd] ->
+                case cmd of
+                    T_BraceGroup _ ts -> all isTestStructure ts
+                    T_Subshell   _ ts -> all isTestStructure ts
+                    _ -> isTestCommand t
+            _ -> isTestCommand t
+
+    isTestCommand t =
+        case t of
+            T_Pipeline _ [] [T_Redirecting _ _ cmd] ->
+                case cmd of
+                    T_Condition {} -> True
+                    _ -> cmd `isCommand` "test"
+            _ -> False
+
+    -- Check if a T_Subshell is used as a condition, e.g. if ( test )
+    -- This technically also triggers for `if true; then ( test ); fi`
+    -- but it's still a valid suggestion.
+    isCompoundCondition chain =
+        case dropWhile skippable (drop 1 chain) of
+            T_IfExpression {}    : _ -> True
+            T_WhileExpression {} : _ -> True
+            T_UntilExpression {} : _ -> True
+            _ -> False
+
+    -- Skip any parent of a T_Subshell until we reach something interesting
+    skippable t =
+        case t of
+            T_Redirecting _ [] _ -> True
+            T_Pipeline _ [] _ -> True
+            T_Annotation {} -> True
+            _ -> False
+
+prop_checkInvertedStringTest1 = verify checkInvertedStringTest "[ ! -z $var ]"
+prop_checkInvertedStringTest2 = verify checkInvertedStringTest "! [[ -n $var ]]"
+prop_checkInvertedStringTest3 = verifyNot checkInvertedStringTest "! [ -x $var ]"
+prop_checkInvertedStringTest4 = verifyNot checkInvertedStringTest "[[ ! -w $var ]]"
+prop_checkInvertedStringTest5 = verifyNot checkInvertedStringTest "[ -z $var ]"
+checkInvertedStringTest _ t =
+    case t of
+        TC_Unary _ _ "!" (TC_Unary _ _ op _) ->
+            case op of
+                "-n" -> style (getId t) 2236 "Use -z instead of ! -n."
+                "-z" -> style (getId t) 2236 "Use -n instead of ! -z."
+                _ -> return ()
+        T_Banged _ (T_Pipeline _ _
+          [T_Redirecting _ _ (T_Condition _ _ (TC_Unary _ _ op _))]) ->
+            case op of
+                "-n" -> style (getId t) 2237 "Use [ -z .. ] instead of ! [ -n .. ]."
+                "-z" -> style (getId t) 2237 "Use [ -n .. ] instead of ! [ -z .. ]."
+                _ -> return ()
+        _ -> return ()
+
+prop_checkRedirectionToCommand1 = verify checkRedirectionToCommand "ls > rm"
+prop_checkRedirectionToCommand2 = verifyNot checkRedirectionToCommand "ls > 'rm'"
+prop_checkRedirectionToCommand3 = verifyNot checkRedirectionToCommand "ls > myfile"
+checkRedirectionToCommand _ t =
+    case t of
+        T_IoFile _ _ (T_NormalWord id [T_Literal _ str]) | str `elem` commonCommands
+            && str /= "file" -> -- This would be confusing
+                warn id 2238 "Redirecting to/from command name instead of file. Did you want pipes/xargs (or quote to ignore)?"
+        _ -> return ()
+
+prop_checkNullaryExpansionTest1 = verify checkNullaryExpansionTest "[[ $(a) ]]"
+prop_checkNullaryExpansionTest2 = verify checkNullaryExpansionTest "[[ $a ]]"
+prop_checkNullaryExpansionTest3 = verifyNot checkNullaryExpansionTest "[[ $a=1 ]]"
+prop_checkNullaryExpansionTest4 = verifyNot checkNullaryExpansionTest "[[ -n $(a) ]]"
+prop_checkNullaryExpansionTest5 = verify checkNullaryExpansionTest "[[ \"$a$b\" ]]"
+prop_checkNullaryExpansionTest6 = verify checkNullaryExpansionTest "[[ `x` ]]"
+checkNullaryExpansionTest params t =
+    case t of
+        TC_Nullary _ _ word ->
+            case getWordParts word of
+                [t] | isCommandSubstitution t ->
+                    styleWithFix id 2243 "Prefer explicit -n to check for output (or run command without [/[[ to check for success)." fix
+
+                -- If they're constant, you get SC2157 &co
+                x | all (not . isConstant) x ->
+                    styleWithFix id 2244 "Prefer explicit -n to check non-empty string (or use =/-ne to check boolean/integer)." fix
+                _ -> return ()
+            where
+                id = getId word
+                fix = fixWith [replaceStart id params 0 "-n "]
+        _ -> return ()
+
+
+prop_checkDollarQuoteParen1 = verify checkDollarQuoteParen "$\"(foo)\""
+prop_checkDollarQuoteParen2 = verify checkDollarQuoteParen "$\"{foo}\""
+prop_checkDollarQuoteParen3 = verifyNot checkDollarQuoteParen "\"$(foo)\""
+prop_checkDollarQuoteParen4 = verifyNot checkDollarQuoteParen "$\"..\""
+checkDollarQuoteParen params t =
+    case t of
+        T_DollarDoubleQuoted id ((T_Literal _ (c:_)):_) | c `elem` "({" ->
+            warnWithFix id 2247 "Flip leading $ and \" if this should be a quoted substitution." (fix id)
+        _ -> return ()
+  where
+    fix id = fixWith [replaceStart id params 2 "\"$"]
+
+prop_checkTranslatedStringVariable1 = verify checkTranslatedStringVariable "foo_bar2=val; $\"foo_bar2\""
+prop_checkTranslatedStringVariable2 = verifyNot checkTranslatedStringVariable "$\"foo_bar2\""
+prop_checkTranslatedStringVariable3 = verifyNot checkTranslatedStringVariable "$\"..\""
+prop_checkTranslatedStringVariable4 = verifyNot checkTranslatedStringVariable "var=val; $\"$var\""
+prop_checkTranslatedStringVariable5 = verifyNot checkTranslatedStringVariable "foo=var; bar=val2; $\"foo bar\""
+checkTranslatedStringVariable params (T_DollarDoubleQuoted id [T_Literal _ s])
+  | all isVariableChar s
+  && Map.member s assignments
+  = warnWithFix id 2256 "This translated string is the name of a variable. Flip leading $ and \" if this should be a quoted substitution." (fix id)
+  where
+    assignments = foldl (flip ($)) Map.empty (map insertAssignment $ variableFlow params)
+    insertAssignment (Assignment (_, token, name, _)) | isVariableName name =
+        Map.insert name token
+    insertAssignment _ = Prelude.id
+    fix id = fixWith [replaceStart id params 2 "\"$"]
+checkTranslatedStringVariable _ _ = return ()
+
+prop_checkDefaultCase1 = verify checkDefaultCase "case $1 in a) true ;; esac"
+prop_checkDefaultCase2 = verify checkDefaultCase "case $1 in ?*?) true ;; *? ) true ;; esac"
+prop_checkDefaultCase3 = verifyNot checkDefaultCase "case $1 in x|*) true ;; esac"
+prop_checkDefaultCase4 = verifyNot checkDefaultCase "case $1 in **) true ;; esac"
+checkDefaultCase _ t =
+    case t of
+        T_CaseExpression id _ list ->
+            unless (any canMatchAny list) $
+                info id 2249 "Consider adding a default *) case, even if it just exits with error."
+        _ -> return ()
+  where
+    canMatchAny (_, list, _) = any canMatchAny' list
+    -- hlint objects to 'pattern' as a variable name
+    canMatchAny' pat = fromMaybe False $ do
+        pg <- wordToExactPseudoGlob pat
+        return $ pseudoGlobIsSuperSetof pg [PGMany]
+
+prop_checkUselessBang1 = verify checkUselessBang "set -e; ! true; rest"
+prop_checkUselessBang2 = verifyNot checkUselessBang "! true; rest"
+prop_checkUselessBang3 = verify checkUselessBang "set -e; while true; do ! true; done"
+prop_checkUselessBang4 = verifyNot checkUselessBang "set -e; if ! true; then true; fi"
+prop_checkUselessBang5 = verifyNot checkUselessBang "set -e; ( ! true )"
+prop_checkUselessBang6 = verify checkUselessBang "set -e; { ! true; }"
+prop_checkUselessBang7 = verifyNot checkUselessBang "set -e; x() { ! [ x ]; }"
+prop_checkUselessBang8 = verifyNot checkUselessBang "set -e; if { ! true; }; then true; fi"
+prop_checkUselessBang9 = verifyNot checkUselessBang "set -e; while ! true; do true; done"
+checkUselessBang params t = when (hasSetE params) $ mapM_ check (getNonReturningCommands t)
+  where
+    check t =
+        case t of
+            T_Banged id cmd | not $ isCondition (getPath (parentMap params) t) ->
+                addComment $ makeCommentWithFix InfoC id 2251
+                        "This ! is not on a condition and skips errexit. Use `&& exit 1` instead, or make sure $? is checked."
+                        (fixWith [replaceStart id params 1 "", replaceEnd (getId cmd) params 0 " && exit 1"])
+            _ -> return ()
+
+    -- Get all the subcommands that aren't likely to be the return value
+    getNonReturningCommands :: Token -> [Token]
+    getNonReturningCommands t =
+        case t of
+            T_Script _ _ list -> dropLast list
+            T_BraceGroup _ list -> if isFunctionBody t then dropLast list else list
+            T_Subshell _ list -> dropLast list
+            T_WhileExpression _ conds cmds -> dropLast conds ++ cmds
+            T_UntilExpression _ conds cmds -> dropLast conds ++ cmds
+            T_ForIn _ _ _ list -> list
+            T_ForArithmetic _ _ _ _ list -> list
+            T_Annotation _ _ t -> getNonReturningCommands t
+            T_IfExpression _ conds elses ->
+                concatMap (dropLast . fst) conds ++ concatMap snd conds ++ elses
+            _ -> []
+
+    isFunctionBody t =
+        case getPath (parentMap params) t of
+            _:T_Function {}:_-> True
+            _ -> False
+
+    dropLast t =
+        case t of
+            [_] -> []
+            x:rest -> x : dropLast rest
+            _ -> []
+
+prop_checkModifiedArithmeticInRedirection1 = verify checkModifiedArithmeticInRedirection "ls > $((i++))"
+prop_checkModifiedArithmeticInRedirection2 = verify checkModifiedArithmeticInRedirection "cat < \"foo$((i++)).txt\""
+prop_checkModifiedArithmeticInRedirection3 = verifyNot checkModifiedArithmeticInRedirection "while true; do true; done > $((i++))"
+prop_checkModifiedArithmeticInRedirection4 = verify checkModifiedArithmeticInRedirection "cat <<< $((i++))"
+prop_checkModifiedArithmeticInRedirection5 = verify checkModifiedArithmeticInRedirection "cat << foo\n$((i++))\nfoo\n"
+prop_checkModifiedArithmeticInRedirection6 = verifyNot checkModifiedArithmeticInRedirection "#!/bin/dash\nls > $((i=i+1))"
+checkModifiedArithmeticInRedirection params t = unless (shellType params == Dash) $
+    case t of
+        T_Redirecting _ redirs (T_SimpleCommand _ _ (_:_)) -> mapM_ checkRedirs redirs
+        _ -> return ()
+  where
+    checkRedirs t =
+        case t of
+            T_FdRedirect _ _ (T_IoFile _ _ word) ->
+                mapM_ checkArithmetic $ getWordParts word
+            T_FdRedirect _ _ (T_HereString _ word) ->
+                mapM_ checkArithmetic $ getWordParts word
+            T_FdRedirect _ _ (T_HereDoc _ _ _ _ list) ->
+                mapM_ checkArithmetic list
+            _ -> return ()
+    checkArithmetic t =
+        case t of
+            T_DollarArithmetic _ x -> checkModifying x
+            _ -> return ()
+    checkModifying t =
+        case t of
+            TA_Sequence _ list -> mapM_ checkModifying list
+            TA_Unary id s _ | s `elem` ["|++", "++|", "|--", "--|"] -> warnFor id
+            TA_Assignment id _ _ _ -> warnFor id
+            TA_Binary _ _ x y -> mapM_ checkModifying [x ,y]
+            TA_Trinary _ x y z -> mapM_ checkModifying [x, y, z]
+            _ -> return ()
+    warnFor id =
+        warn id 2257 "Arithmetic modifications in command redirections may be discarded. Do them separately."
+
+prop_checkAliasUsedInSameParsingUnit1 = verifyTree checkAliasUsedInSameParsingUnit "alias x=y; x"
+prop_checkAliasUsedInSameParsingUnit2 = verifyNotTree checkAliasUsedInSameParsingUnit "alias x=y\nx"
+prop_checkAliasUsedInSameParsingUnit3 = verifyTree checkAliasUsedInSameParsingUnit "{ alias x=y\nx\n}"
+prop_checkAliasUsedInSameParsingUnit4 = verifyNotTree checkAliasUsedInSameParsingUnit "alias x=y; 'x';"
+prop_checkAliasUsedInSameParsingUnit5 = verifyNotTree checkAliasUsedInSameParsingUnit ":\n{\n#shellcheck disable=SC2262\nalias x=y\nx\n}"
+prop_checkAliasUsedInSameParsingUnit6 = verifyNotTree checkAliasUsedInSameParsingUnit ":\n{\n#shellcheck disable=SC2262\nalias x=y\nalias x=z\nx\n}" -- Only consider the first instance
+checkAliasUsedInSameParsingUnit :: Parameters -> Token -> [TokenComment]
+checkAliasUsedInSameParsingUnit params root =
+    let
+        -- Get all root commands
+        commands = concat $ getCommandSequences root
+        -- Group them by whether they start on the same line where the previous one ended
+        units = groupByLink followsOnLine commands
+    in
+        execWriter $ sequence_ $ map checkUnit units
+  where
+    lineSpan t =
+        let m = tokenPositions params in do
+            (start, end) <- Map.lookup t m
+            return $ (posLine start, posLine end)
+
+    followsOnLine a b = fromMaybe False $ do
+        (_, end) <- lineSpan (getId a)
+        (start, _) <- lineSpan (getId b)
+        return $ end == start
+
+    checkUnit :: [Token] -> Writer [TokenComment] ()
+    checkUnit unit = evalStateT (mapM_ (doAnalysis findCommands) unit) (Map.empty)
+
+    isSourced t =
+        let
+            f (T_SourceCommand {}) = True
+            f _ = False
+        in
+            any f $ getPath (parentMap params) t
+
+    findCommands :: Token -> StateT (Map.Map String Token) (Writer [TokenComment]) ()
+    findCommands t = case t of
+            T_SimpleCommand _ _ (cmd:args) ->
+                case getUnquotedLiteral cmd of
+                    Just "alias" ->
+                        mapM_ addAlias args
+                    Just name | '/' `notElem` name -> do
+                        cmd <- gets (Map.lookup name)
+                        case cmd of
+                            Just alias ->
+                                unless (isSourced t || shouldIgnoreCode params 2262 alias) $ do
+                                    warn (getId alias) 2262 "This alias can't be defined and used in the same parsing unit. Use a function instead."
+                                    info (getId t) 2263 "Since they're in the same parsing unit, this command will not refer to the previously mentioned alias."
+                            _ -> return ()
+                    _ -> return ()
+            _ -> return ()
+    addAlias arg = do
+        let (name, value) = break (== '=') $ getLiteralStringDef "-" arg
+        when (isVariableName name && not (null value)) $
+            modify (Map.insertWith (\new old -> old) name arg)
+
+-- Like groupBy, but compares pairs of adjacent elements, rather than against the first of the span
+prop_groupByLink1 = groupByLink (\a b -> a+1 == b) [1,2,3,2,3,7,8,9] == [[1,2,3], [2,3], [7,8,9]]
+prop_groupByLink2 = groupByLink (==) ([] :: [()]) == []
+groupByLink :: (a -> a -> Bool) -> [a] -> [[a]]
+groupByLink f list =
+    case list of
+        [] -> []
+        (x:xs) -> g x [] xs
+  where
+    g current span (next:rest) =
+        if f current next
+        then g next (current:span) rest
+        else (reverse $ current:span) : g next [] rest
+    g current span [] = [reverse (current:span)]
+
+
+prop_checkBlatantRecursion1 = verify checkBlatantRecursion ":(){ :|:& };:"
+prop_checkBlatantRecursion2 = verify checkBlatantRecursion "f() { f; }"
+prop_checkBlatantRecursion3 = verifyNot checkBlatantRecursion "f() { command f; }"
+prop_checkBlatantRecursion4 = verify checkBlatantRecursion "cd() { cd \"$lol/$1\" || exit; }"
+prop_checkBlatantRecursion5 = verifyNot checkBlatantRecursion "cd() { [ -z \"$1\" ] || cd \"$1\"; }"
+prop_checkBlatantRecursion6 = verifyNot checkBlatantRecursion "cd() { something; cd $1; }"
+prop_checkBlatantRecursion7 = verifyNot checkBlatantRecursion "cd() { builtin cd $1; }"
+checkBlatantRecursion :: Parameters -> Token -> Writer [TokenComment] ()
+checkBlatantRecursion params t =
+    case t of
+        T_Function _ _ _ name body ->
+            case getCommandSequences body of
+                    [first : _] -> checkList name first
+                    _ -> return ()
+        _ -> return ()
+  where
+    checkList :: String -> Token -> Writer [TokenComment] ()
+    checkList name t =
+        case t of
+            T_Backgrounded _ t -> checkList name t
+            T_AndIf _ lhs _ -> checkList name lhs
+            T_OrIf _ lhs _ -> checkList name lhs
+            T_Pipeline _ _ cmds -> mapM_ (checkCommand name) cmds
+            _ -> return ()
+
+    checkCommand :: String -> Token -> Writer [TokenComment] ()
+    checkCommand name cmd = sequence_ $ do
+        let (invokedM, t) = getCommandNameAndToken True cmd
+        invoked <- invokedM
+        guard $ name == invoked
+        return $
+            errWithFix (getId t) 2264
+                ("This function unconditionally re-invokes itself. Missing 'command'?")
+                (fixWith [replaceStart (getId t) params 0 $ "command "])
+
+
+prop_checkBadTestAndOr1 = verify checkBadTestAndOr "[ x ] & [ y ]"
+prop_checkBadTestAndOr2 = verify checkBadTestAndOr "test -e foo & [ y ]"
+prop_checkBadTestAndOr3 = verify checkBadTestAndOr "[ x ] | [ y ]"
+checkBadTestAndOr params t =
+    case t of
+        T_Pipeline _ seps cmds@(_:_:_) -> checkOrs seps cmds
+        T_Backgrounded id cmd -> checkAnds id cmd
+        _ -> return ()
+  where
+    checkOrs seps cmds =
+        let maybeSeps = map Just seps
+            commandWithSeps = zip3 (Nothing:maybeSeps) cmds (maybeSeps ++ [Nothing])
+        in
+            mapM_ checkTest commandWithSeps
+    checkTest (before, cmd, after) =
+        when (isTest cmd) $ do
+            checkPipe before
+            checkPipe after
+
+    checkPipe t =
+        case t of
+            Just (T_Pipe id "|") ->
+                warnWithFix id 2266 "Use || for logical OR. Single | will pipe." $
+                    fixWith [replaceEnd id params 0 "|"]
+            _ -> return ()
+
+    checkAnds id t =
+        case t of
+            T_AndIf _ _ rhs -> checkAnds id rhs
+            T_OrIf _ _ rhs -> checkAnds id rhs
+            T_Pipeline _ _ list | not (null list) -> checkAnds id (last list)
+            cmd -> when (isTest cmd) $
+                errWithFix id 2265 "Use && for logical AND. Single & will background and return true." $
+                    (fixWith [replaceEnd id params 0 "&"])
+
+    isTest t =
+        case t of
+            T_Condition {} -> True
+            T_SimpleCommand {} -> t `isCommand` "test"
+            T_Redirecting _ _ t -> isTest t
+            T_Annotation _ _ t -> isTest t
+            _ -> False
+
+prop_checkComparisonWithLeadingX1 = verify checkComparisonWithLeadingX "[ x$foo = xlol ]"
+prop_checkComparisonWithLeadingX2 = verify checkComparisonWithLeadingX "test x$foo = xlol"
+prop_checkComparisonWithLeadingX3 = verifyNot checkComparisonWithLeadingX "[ $foo = xbar ]"
+prop_checkComparisonWithLeadingX4 = verifyNot checkComparisonWithLeadingX "test $foo = xbar"
+prop_checkComparisonWithLeadingX5 = verify checkComparisonWithLeadingX "[ \"x$foo\" = 'xlol' ]"
+prop_checkComparisonWithLeadingX6 = verify checkComparisonWithLeadingX "[ x\"$foo\" = x'lol' ]"
+checkComparisonWithLeadingX params t =
+    case t of
+        TC_Binary id typ op lhs rhs | op == "=" || op == "==" ->
+            check lhs rhs
+        T_SimpleCommand _ _ [cmd, lhs, op, rhs] |
+            getLiteralString cmd == Just "test" &&
+                getLiteralString op `elem` [Just "=", Just "=="] ->
+                    check lhs rhs
+        _ -> return ()
+  where
+    msg = "Avoid outdated x-prefix in comparisons as it no longer serves a purpose."
+    check lhs rhs = sequence_ $ do
+        l <- fixLeadingX lhs
+        r <- fixLeadingX rhs
+        return $ styleWithFix (getId lhs) 2268 msg $ fixWith [l, r]
+
+    fixLeadingX token =
+         case getWordParts token of
+            T_Literal id ('x':_):_ ->
+                case token of
+                    -- The side is a single, unquoted x, so we have to quote
+                    T_NormalWord _ [T_Literal id "x"] ->
+                        return $ replaceStart id params 1 "\"\""
+                    -- Otherwise we can just delete it
+                    _ -> return $ replaceStart id params 1 ""
+            T_SingleQuoted id ('x':_):_ ->
+                -- Replace the single quote and x
+                return $ replaceStart id params 2 "'"
+            _ -> Nothing
+
+prop_checkAssignToSelf1 = verify checkAssignToSelf "x=$x"
+prop_checkAssignToSelf2 = verify checkAssignToSelf "x=${x}"
+prop_checkAssignToSelf3 = verify checkAssignToSelf "x=\"$x\""
+prop_checkAssignToSelf4 = verifyNot checkAssignToSelf "x=$x mycmd"
+checkAssignToSelf _ t =
+    case t of
+        T_SimpleCommand _ vars [] -> mapM_ check vars
+        _ -> return ()
+  where
+    check t =
+        case t of
+            T_Assignment id Assign name [] t ->
+                case getWordParts t of
+                    [T_DollarBraced _ _ b] -> do
+                        when (Just name == getLiteralString b) $
+                            msg id
+                    _ -> return ()
+            _ -> return ()
+    msg id = info id 2269 "This variable is assigned to itself, so the assignment does nothing."
 
 
 return []
